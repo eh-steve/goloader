@@ -59,10 +59,12 @@ type Linker struct {
 
 type CodeModule struct {
 	segment
-	Syms   map[string]uintptr
-	module *moduledata
-	gcdata []byte
-	gcbss  []byte
+	Syms                  map[string]uintptr
+	module                *moduledata
+	gcdata                []byte
+	gcbss                 []byte
+	patchedTypeMethodsIfn map[*_type][]int
+	patchedTypeMethodsTfn map[*_type][]int
 }
 
 var (
@@ -510,6 +512,8 @@ collect:
 		typehash[t.hash] = append(tlist, t)
 	}
 
+	patchedTypeMethodsIfn := make(map[*_type][]int)
+	patchedTypeMethodsTfn := make(map[*_type][]int)
 	segment := &codeModule.segment
 	byteorder := linker.Arch.ByteOrder
 	for _, symbol := range linker.symMap {
@@ -529,6 +533,7 @@ collect:
 				// if this is pointing to a type descriptor at an offset inside this binary, we should deduplicate it against
 				// already known types from other modules to allow fast type assertion using *_type pointer equality
 				t := (*_type)(unsafe.Pointer(addr))
+				prevT := (*_type)(unsafe.Pointer(addr))
 				for _, candidate := range typehash[t.hash] {
 					seen := map[_typePair]struct{}{}
 					if typesEqual(t, candidate, seen) {
@@ -538,7 +543,14 @@ collect:
 				}
 
 				// Only relocate code if the type is a duplicate
-				if uintptr(unsafe.Pointer(t)) != addr {
+				if t != prevT {
+					u := t.uncommon()
+					prevU := prevT.uncommon()
+					err := patchTypeMethods(t, u, prevU, patchedTypeMethodsIfn, patchedTypeMethodsTfn)
+					if err != nil {
+						return err
+					}
+
 					addr = uintptr(unsafe.Pointer(t))
 					switch loc.Type {
 					case reloctype.R_PCREL:
@@ -577,6 +589,14 @@ collect:
 			}
 		}
 	}
+	codeModule.patchedTypeMethodsIfn = patchedTypeMethodsIfn
+	codeModule.patchedTypeMethodsTfn = patchedTypeMethodsTfn
+
+	if err != nil {
+		return err
+	}
+	err = codeModule.patchTypeMethods()
+
 	return err
 }
 
@@ -655,6 +675,10 @@ func Load(linker *Linker, symPtr map[string]uintptr) (codeModule *CodeModule, er
 }
 
 func (cm *CodeModule) Unload() error {
+	err := cm.revertPatchedTypeMethods()
+	if err != nil {
+		return err
+	}
 	removeitabs(cm.module)
 	runtime.GC()
 	modulesLock.Lock()
