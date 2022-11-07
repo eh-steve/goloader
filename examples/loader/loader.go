@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/pkujhd/goloader/examples/issue55/p"
 	"net/http"
 	"os"
 	"runtime"
@@ -93,12 +94,13 @@ func main() {
 		}
 		runFuncPtr := codeModule.Syms[*run]
 		if runFuncPtr == 0 {
-			fmt.Println("Load error! not find function:", *run)
+			fmt.Println("Load error! not find function:", *run, codeModule.Syms)
 			return
 		}
 		funcPtrContainer := (uintptr)(unsafe.Pointer(&runFuncPtr))
-		runFunc := *(*func())(unsafe.Pointer(&funcPtrContainer))
-		runFunc()
+		runFunc := *(*func(p.Intf) p.Intf)(unsafe.Pointer(&funcPtrContainer))
+		r := runFunc(&p.Stru{})
+		fmt.Println("r:", r)
 		os.Stdout.Sync()
 		codeModule.Unload()
 
