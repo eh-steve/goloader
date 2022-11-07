@@ -29,7 +29,10 @@ type itabTableType struct {
 }
 
 //go:linkname itabTable runtime.itabTable
-var itabTable *itabTableType // pointer to current table
+var itabTable unsafe.Pointer // pointer to current table
+
+// Avoids "go.info.runtime.itabTable: relocation target go.info.*github.com/pkujhd/goloader.itabTableType not defined"
+var itabTableTyped = (*itabTableType)(itabTable)
 
 //go:linkname itabLock runtime.itabLock
 var itabLock mutex
@@ -48,8 +51,8 @@ func additabs(module *moduledata) {
 func removeitabs(module *moduledata) bool {
 	lock(&itabLock)
 	defer unlock(&itabLock)
-	for i := uintptr(0); i < itabTable.size; i++ {
-		p := (**itab)(add(unsafe.Pointer(&itabTable.entries), i*PtrSize))
+	for i := uintptr(0); i < itabTableTyped.size; i++ {
+		p := (**itab)(add(unsafe.Pointer(&itabTableTyped.entries), i*PtrSize))
 		m := (*itab)(loadp(unsafe.Pointer(p)))
 		if m != nil {
 			uintptrm := uintptr(unsafe.Pointer(m))
@@ -58,7 +61,7 @@ func removeitabs(module *moduledata) bool {
 			if (inter >= module.types && inter <= module.etypes) || (_type >= module.types && _type <= module.etypes) ||
 				(uintptrm >= module.types && uintptrm <= module.etypes) {
 				atomicstorep(unsafe.Pointer(p), unsafe.Pointer(nil))
-				itabTable.count = itabTable.count - 1
+				itabTableTyped.count = itabTableTyped.count - 1
 			}
 		}
 	}
