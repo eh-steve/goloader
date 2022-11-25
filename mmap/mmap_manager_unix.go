@@ -6,6 +6,7 @@ package mmap
 import (
 	"bytes"
 	"fmt"
+	"github.com/pkujhd/goloader/mmap/mapping"
 	"os"
 	"strconv"
 	"strings"
@@ -16,15 +17,15 @@ import (
 // TODO: OpenBSD needs to use procmap https://man.openbsd.org/procmap.1
 // TODO: Solaris needs to use /proc/[pid]/map with a different format
 // TODO: Dragonfly needs  /proc/curproc/map with a different format
-func getCurrentProcMaps() ([]Mapping, error) {
+func getCurrentProcMaps() ([]mapping.Mapping, error) {
 	mapsData, err := os.ReadFile("/proc/self/maps")
 	if err != nil {
 		return nil, fmt.Errorf("could not read '/proc/self/maps': %w", err)
 	}
 	lines := bytes.Split(mapsData, []byte("\n"))
-	var mappings []Mapping
+	var mappings []mapping.Mapping
 	for i, line := range lines {
-		var mapping Mapping
+		var mapping mapping.Mapping
 		mmapFields := strings.Fields(string(line))
 		if len(mmapFields) == 0 {
 			continue

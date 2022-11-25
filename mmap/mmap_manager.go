@@ -2,26 +2,13 @@ package mmap
 
 import (
 	"fmt"
+	"github.com/pkujhd/goloader/mmap/mapping"
 	"math"
 	"sort"
 	"sync"
 	"syscall"
 	"unsafe"
 )
-
-type Mapping struct {
-	StartAddr   uintptr
-	EndAddr     uintptr
-	ReadPerm    bool
-	WritePerm   bool
-	ExecutePerm bool
-	SharedPerm  bool
-	PrivatePerm bool
-	Offset      uintptr
-	Dev         string
-	Inode       uint64
-	PathName    string
-}
 
 var pageSize = uintptr(syscall.Getpagesize())
 
@@ -38,7 +25,7 @@ type gap struct {
 	endAddr   uintptr
 }
 
-func findNextFreeAddressesAfterTarget(targetAddr uintptr, size int, mappings []Mapping) (gaps []gap, err error) {
+func findNextFreeAddressesAfterTarget(targetAddr uintptr, size int, mappings []mapping.Mapping) (gaps []gap, err error) {
 	sort.Slice(mappings, func(i, j int) bool {
 		return mappings[i].StartAddr < mappings[j].StartAddr
 	})
@@ -104,7 +91,7 @@ func AcquireMapping(size int, mapFunc func(size int, addr uintptr) ([]byte, erro
 	return nil, fmt.Errorf("failed to aquire mapping between taken mappings: \n%s", formatTakenMappings(mappings))
 }
 
-func formatTakenMappings(mappings []Mapping) string {
+func formatTakenMappings(mappings []mapping.Mapping) string {
 	var mappingTakenRanges string
 	for _, m := range mappings {
 		mappingTakenRanges += fmt.Sprintf("0x%x - 0x%x  %s\n", m.StartAddr, m.EndAddr, m.PathName)

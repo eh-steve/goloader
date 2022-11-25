@@ -3,6 +3,11 @@
 
 package mmap
 
+import (
+	"syscall"
+	"unsafe"
+)
+
 type libcFunc uintptr
 
 //go:linkname libc_mmap libc_mmap
@@ -11,7 +16,7 @@ type libcFunc uintptr
 var libc_mmap,
 	libc_munmap libcFunc
 
-func sysvicall6(trap, nargs, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err Errno)
+func sysvicall6(trap, nargs, a1, a2, a3, a4, a5, a6 uintptr) (r1, r2 uintptr, err syscall.Errno)
 
 func mmap(addr uintptr, length uintptr, prot int, flag int, fd int, pos int64) (ret uintptr, err error) {
 	r0, _, e1 := sysvicall6(uintptr(unsafe.Pointer(&libc_mmap)), 6, uintptr(addr), uintptr(length), uintptr(prot), uintptr(flag), uintptr(fd), uintptr(pos))

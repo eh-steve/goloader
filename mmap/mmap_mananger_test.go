@@ -5,6 +5,14 @@ import (
 	"testing"
 )
 
+func TestMmapVmData(t *testing.T) {
+	mappings, err := getCurrentProcMaps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println(mappings)
+}
+
 func TestMmapManager(t *testing.T) {
 	data, err := Mmap(215123)
 	if err != nil {
