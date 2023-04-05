@@ -1514,3 +1514,47 @@ func TestGCGlobals(t *testing.T) {
 		})
 	}
 }
+
+func TestIssue71(t *testing.T) {
+	type IPerson interface {
+		Say(word string)
+		Get() string
+	}
+
+	conf := jit.BuildConfig{
+		GoBinary:              goBinary,
+		KeepTempFiles:         false,
+		ExtraBuildFlags:       nil,
+		BuildEnv:              nil,
+		TmpDir:                "",
+		DebugLog:              false,
+		HeapStrings:           heapStrings,
+		StringContainerSize:   stringContainerSize,
+		RandomSymbolNameOrder: false,
+	}
+
+	data := testData{
+		files: []string{"./testdata/test_issue71/test.go"},
+		pkg:   "./testdata/test_issue71",
+	}
+	testNames := []string{"BuildGoFiles", "BuildGoPackage", "BuildGoText"}
+	for _, testName := range testNames {
+		t.Run(testName, func(t *testing.T) {
+			module, symbols := buildLoadable(t, conf, testName, data)
+
+			testFunc := symbols["New"].(func() any)
+
+			person := testFunc().(IPerson)
+			person.Say("blah")
+			if person.Get() != "blah" {
+				t.Errorf("expected %s to be 'blah'", person.Get())
+			}
+			err := module.Unload()
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = module.UnloadStringMap()
+			time.Sleep(time.Second)
+		})
+	}
+}
