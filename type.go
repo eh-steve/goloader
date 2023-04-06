@@ -1,6 +1,10 @@
 package goloader
 
 import (
+	"cmd/objfile/goobj"
+	"cmd/objfile/obj"
+	"cmd/objfile/objabi"
+	"fmt"
 	"reflect"
 	"runtime"
 	"strings"
@@ -105,35 +109,119 @@ func (t *_type) Elem() *_type               { return _Elem(t) }
 //
 //	import "github.com/org/somepackage/v4" + somepackage.SomeStruct
 //	 =>  github.com/org/somepackage/v4.SomeStruct
-func fullyQualifiedName(t *_type, pkgpath string) string {
-	// If pkgpath is empty, it's either:
-	//  1) a builtin type
-	//  2) an anonymous struct
-	//  3) another anonymous composite type (e.g. array or slice)
-	// For 2 and 3), we probably don't need to fully qualify the types as fully supporting cross-binary anonymous types will be awkward
-	name := t.nameOff(t.str).name()
-	if pkgpath == "" {
-		return name
+func resolveFullyQualifiedSymbolName(t *_type) string {
+	typ := AsType(t)
+	pkgPath := objabi.PathToPrefix(typ.PkgPath())
+	name := typ.Name()
+	if pkgPath != "" && name != "" {
+		return pkgPath + "." + name
 	}
-
-	// Find the first dot, and read backwards until we find a '*' or a ']'
-	dot := strings.IndexByte(name, '.')
-
-	if dot == -1 {
-		return name
-	}
-	start := dot
-loop:
-	for ; start >= 0; start-- {
-		switch name[start] {
-		case ']', '*', ' ':
-			start++
-			break loop
+	switch t.Kind() {
+	case reflect.Ptr:
+		return "*" + resolveFullyQualifiedSymbolName(toType(typ.Elem()))
+	case reflect.Struct:
+		if typ.NumField() == 0 {
+			return typ.String()
 		}
+		fields := make([]string, typ.NumField())
+		for i := 0; i < typ.NumField(); i++ {
+			fieldName := typ.Field(i).Name + " "
+			if typ.Field(i).Anonymous {
+				fieldName = ""
+			}
+			fieldPkgPath := ""
+			if typ.Field(i).PkgPath != "" {
+				fieldPkgPath = typ.Field(i).PkgPath + "."
+			}
+			fields[i] = fmt.Sprintf("%s%s%s", fieldPkgPath, fieldName, resolveFullyQualifiedSymbolName(toType(typ.Field(i).Type)))
+		}
+		return fmt.Sprintf("struct { %s }", strings.Join(fields, "; "))
+	case reflect.Map:
+		return fmt.Sprintf("map[%s]%s", resolveFullyQualifiedSymbolName(toType(typ.Key())), resolveFullyQualifiedSymbolName(toType(typ.Elem())))
+	case reflect.Chan:
+		switch reflect.ChanDir(typ.ChanDir()) {
+		case reflect.BothDir:
+			return fmt.Sprintf("chan %s", resolveFullyQualifiedSymbolName(toType(typ.Elem())))
+		case reflect.RecvDir:
+			return fmt.Sprintf("<-chan %s", resolveFullyQualifiedSymbolName(toType(typ.Elem())))
+		case reflect.SendDir:
+			return fmt.Sprintf("chan<- %s", resolveFullyQualifiedSymbolName(toType(typ.Elem())))
+		}
+	case reflect.Slice:
+		return fmt.Sprintf("[]%s", resolveFullyQualifiedSymbolName(toType(typ.Elem())))
+	case reflect.Array:
+		return fmt.Sprintf("[%d]%s", typ.Len(), resolveFullyQualifiedSymbolName(toType(typ.Elem())))
+	case reflect.Func:
+		ins := make([]string, typ.NumIn())
+		outs := make([]string, typ.NumOut())
+		for i := 0; i < typ.NumIn(); i++ {
+			ins[i] = resolveFullyQualifiedSymbolName(toType(typ.In(i)))
+			if i == typ.NumIn()-1 && typ.IsVariadic() {
+				ins[i] = "..." + resolveFullyQualifiedSymbolName(toType(typ.In(i).Elem()))
+			}
+		}
+		for i := 0; i < typ.NumOut(); i++ {
+			outs[i] = resolveFullyQualifiedSymbolName(toType(typ.Out(i)))
+		}
+		funcName := "func(" + strings.Join(ins, ", ") + ")"
+		if len(outs) > 0 {
+			funcName += " "
+		}
+		if len(outs) > 1 {
+			funcName += "("
+		}
+		funcName += strings.Join(outs, ", ")
+		if len(outs) > 1 {
+			funcName += ")"
+		}
+		return funcName
+	case reflect.Interface:
+		if goobj.BuiltinIdx(TypePrefix+typ.String(), int(obj.ABI0)) != -1 {
+			// must be a builtin,
+			return typ.String()
+		}
+		if typ.NumMethod() == 0 {
+			return typ.String()
+		}
+		methods := make([]string, typ.NumMethod())
+		ifaceT := (*interfacetype)(unsafe.Pointer(t))
+
+		for i := 0; i < typ.NumMethod(); i++ {
+			methodType := _typeOff(t, ifaceT.mhdr[i].ityp)
+			methodName := _nameOff(t, ifaceT.mhdr[i].name).name()
+			methods[i] = fmt.Sprintf("%s(%s", methodName, strings.TrimPrefix(resolveFullyQualifiedSymbolName(methodType), "func("))
+		}
+		reflect.TypeOf(0)
+		return fmt.Sprintf("interface { %s }", strings.Join(methods, "; "))
+	default:
+		if goobj.BuiltinIdx(TypePrefix+typ.String(), int(obj.ABI0)) != -1 {
+			// must be a builtin,
+			return typ.String()
+		}
+		switch typ.String() {
+		case "int", "uint", "struct {}", "interface {}":
+			return typ.String()
+		}
+		panic("unexpected builtin type: " + typ.String())
 	}
-	localPkgName := name[start:dot]
-	name = strings.Replace(name, localPkgName, pkgpath, 1)
-	return name
+	return ""
+}
+
+func symbolIsVariant(name string) (string, bool) {
+	// need to double check for function scoped types which get a ·N suffix added, and also type.noalg.* variants
+	const noAlgPrefix = TypePrefix + "noalg" + ObjSymbolSeparator
+	i := len(name)
+	for i > 0 && name[i-1] >= '0' && name[i-1] <= '9' {
+		i--
+	}
+	const dot = "·"
+
+	if i >= len(dot) && name[i-len(dot):i] == dot {
+		return name[:i-len(dot)], true
+	} else if strings.HasPrefix(name, noAlgPrefix) {
+		return TypePrefix + strings.TrimPrefix(name, noAlgPrefix), true
+	}
+	return "", false
 }
 
 func funcPkgPath(funcName string) string {
@@ -200,7 +288,7 @@ func regType(symPtr map[string]uintptr, v reflect.Value) {
 				}
 			}
 		}
-		name := fullyQualifiedName(t, pkgpath)
+		name := resolveFullyQualifiedSymbolName(t)
 		if element != nil {
 			symPtr[TypePrefix+name[1:]] = uintptr(unsafe.Pointer(element))
 			if elementElem != nil {
