@@ -281,7 +281,7 @@ func (linker *Linker) relocate(codeModule *CodeModule, symbolMap map[string]uint
 			if duplicated {
 				isTypeWhichShouldNotBeDeduped := false
 				for _, pkgPath := range linker.options.SkipTypeDeduplicationForPackages {
-					if strings.HasPrefix(strings.TrimLeft(strings.TrimPrefix(loc.Sym.Name, TypePrefix), "*"), pkgPath) {
+					if strings.Contains(strings.TrimLeft(strings.TrimPrefix(loc.Sym.Name, TypePrefix), "*"), pkgPath) {
 						isTypeWhichShouldNotBeDeduped = true
 					}
 				}
