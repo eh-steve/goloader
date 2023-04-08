@@ -822,6 +822,136 @@ func (linker *Linker) buildModule(codeModule *CodeModule, symbolMap map[string]u
 	return err
 }
 
+func (linker *Linker) deduplicateTypeDescriptors(codeModule *CodeModule, symbolMap map[string]uintptr) (err error) {
+	// Having called addModule and runtime.modulesinit(), we can now safely use typesEqual()
+	// (which depended on the module being in the linked list for safe name resolution of types).
+	// This means we can now deduplicate type descriptors in the actual code
+	// by relocating their addresses to the equivalent *_type in the main module
+
+	// We need to deduplicate type symbols with the main module according to type hash, since type assertion
+	// uses *_type pointer equality and many overlapping or builtin types may be included twice
+	// We have to do this after adding the module to the linked list since deduplication
+	// depends on symbol resolution across all modules
+	typehash := make(map[uint32][]*_type, len(firstmoduledata.typelinks))
+	buildModuleTypeHash(activeModules()[0], typehash)
+
+	patchedTypeMethodsIfn := make(map[*_type]map[int]struct{})
+	patchedTypeMethodsTfn := make(map[*_type]map[int]struct{})
+	segment := &codeModule.segment
+	byteorder := linker.Arch.ByteOrder
+	for _, symbol := range linker.symMap {
+	relocLoop:
+		for _, loc := range symbol.Reloc {
+			addr := symbolMap[loc.Sym.Name]
+			sym := loc.Sym
+			relocByte := segment.dataByte
+			addrBase := segment.dataBase
+			if symbol.Kind == symkind.STEXT {
+				addrBase = segment.codeBase
+				relocByte = segment.codeByte
+			}
+			if addr != InvalidHandleValue && sym.Kind == symkind.SRODATA &&
+				strings.HasPrefix(sym.Name, TypePrefix) &&
+				!strings.HasPrefix(sym.Name, TypeDoubleDotPrefix) && sym.Offset != -1 {
+
+				// if this is pointing to a type descriptor at an offset inside this binary, we should deduplicate it against
+				// already known types from other modules to allow fast type assertion using *_type pointer equality
+				t := (*_type)(unsafe.Pointer(addr))
+				prevT := (*_type)(unsafe.Pointer(addr))
+				for _, candidate := range typehash[t.hash] {
+					seen := map[_typePair]struct{}{}
+					if typesEqual(t, candidate, seen) {
+						t = candidate
+						break
+					}
+				}
+
+				// Only relocate code if the type is a duplicate
+				if t != prevT {
+					if uintptr(unsafe.Pointer(t)) != symbolMap[FirstModulePrefix+loc.Sym.Name] {
+						// This shouldn't be possible and indicates a registration bug
+						panic(fmt.Sprintf("found another firstmodule type that wasn't registered by goloader: %s", loc.Sym.Name))
+					}
+
+					for _, pkgPathToSkip := range linker.options.SkipTypeDeduplicationForPackages {
+						if t.PkgPath() == pkgPathToSkip {
+							continue relocLoop
+						}
+					}
+					u := t.uncommon()
+					prevU := prevT.uncommon()
+					err := codeModule.patchTypeMethodOffsets(t, u, prevU, patchedTypeMethodsIfn, patchedTypeMethodsTfn)
+					if err != nil {
+						return err
+					}
+
+					addr = uintptr(unsafe.Pointer(t))
+					if linker.options.RelocationDebugWriter != nil {
+						var weakness string
+						if loc.Type&reloctype.R_WEAK > 0 {
+							weakness = "WEAK|"
+						}
+						relocType := weakness + objabi.RelocType(loc.Type&^reloctype.R_WEAK).String()
+						_, _ = fmt.Fprintf(linker.options.RelocationDebugWriter, "DEDUPLICATING   %10s %10s %18s Base: 0x%x Pos: 0x%08x, Addr: 0x%016x AddrFromBase: %12d %s   to    %s\n",
+							objabi.SymKind(symbol.Kind), objabi.SymKind(sym.Kind), relocType, addrBase, uintptr(unsafe.Pointer(&relocByte[loc.Offset])),
+							addr, int(addr)-addrBase, symbol.Name, sym.Name)
+					}
+					switch loc.Type {
+					case reloctype.R_PCREL:
+						// The replaced t from another module will probably yield a massive negative offset, but that's ok as
+						// PC-relative addressing is allowed to be negative (even if not very cache friendly)
+						offset := int(addr) - (addrBase + loc.Offset + loc.Size) + loc.Add
+						if offset > 0x7FFFFFFF || offset < -0x80000000 {
+							err = fmt.Errorf("symName: %s offset: %d overflows!\n", sym.Name, offset)
+						}
+						byteorder.PutUint32(relocByte[loc.Offset:], uint32(offset))
+					case reloctype.R_CALLARM, reloctype.R_CALLARM64, reloctype.R_CALL:
+						panic("This should not be possible")
+					case reloctype.R_ADDRARM64, reloctype.R_ARM64_PCREL_LDST8, reloctype.R_ARM64_PCREL_LDST16, reloctype.R_ARM64_PCREL_LDST32, reloctype.R_ARM64_PCREL_LDST64:
+						err2 := linker.relocateADRP(relocByte[loc.Offset:], loc, segment, addr)
+						if err2 != nil {
+							err = err2
+						}
+					case reloctype.R_ADDR, reloctype.R_WEAKADDR:
+						// TODO - sanity check this
+						address := uintptr(int(addr) + loc.Add)
+						putAddress(byteorder, relocByte[loc.Offset:], uint64(address))
+					case reloctype.R_ADDROFF, reloctype.R_WEAKADDROFF:
+						offset := int(addr) - addrBase + loc.Add
+						if offset > 0x7FFFFFFF || offset < -0x80000000 {
+							err = fmt.Errorf("symName: %s offset: %d overflows!\n", sym.Name, offset)
+						}
+						byteorder.PutUint32(relocByte[loc.Offset:], uint32(offset))
+					case reloctype.R_METHODOFF:
+						if loc.Sym.Kind == symkind.STEXT {
+							addrBase = segment.codeBase
+						}
+						offset := int(addr) - addrBase + loc.Add
+						if offset > 0x7FFFFFFF || offset < -0x80000000 {
+							err = fmt.Errorf("symName:%s offset:%d is overflow!\n", sym.Name, offset)
+						}
+						byteorder.PutUint32(relocByte[loc.Offset:], uint32(offset))
+					case reloctype.R_USETYPE, reloctype.R_USEIFACE, reloctype.R_USEIFACEMETHOD, reloctype.R_ADDRCUOFF, reloctype.R_KEEP:
+						// nothing to do
+					default:
+						panic(fmt.Sprintf("unhandled reloc %s", objabi.RelocType(loc.Type)))
+						// TODO - should we attempt to rewrite other relocations which point at *_types too?
+					}
+				}
+			}
+		}
+	}
+	codeModule.patchedTypeMethodsIfn = patchedTypeMethodsIfn
+	codeModule.patchedTypeMethodsTfn = patchedTypeMethodsTfn
+
+	if err != nil {
+		return err
+	}
+	err = patchTypeMethodTextPtrs(uintptr(codeModule.codeBase), codeModule.patchedTypeMethodsIfn, codeModule.patchedTypeMethodsTfn)
+
+	return err
+}
+
 func (linker *Linker) UnresolvedExternalSymbols(symbolMap map[string]uintptr, ignorePackages []string) map[string]*obj.Sym {
 	symMap := make(map[string]*obj.Sym)
 	for symName, sym := range linker.symMap {
@@ -832,6 +962,11 @@ func (linker *Linker) UnresolvedExternalSymbols(symbolMap map[string]uintptr, ig
 			}
 		}
 		if sym.Offset == InvalidOffset || shouldSkipDedup {
+			if strings.HasPrefix(symName, TypePrefix) {
+				// Always force the rebuild of types in case they've changed between firstmodule and JIT code
+				// They can be checked for structural equality if the JIT code builds it, but not if we blindly use the firstmodule version of a _type
+				symMap[symName] = sym
+			}
 			if _, ok := symbolMap[symName]; !ok || shouldSkipDedup {
 				if _, ok := linker.objsymbolMap[symName]; !ok || shouldSkipDedup {
 					symMap[symName] = sym
@@ -932,9 +1067,11 @@ func Load(linker *Linker, symPtr map[string]uintptr) (codeModule *CodeModule, er
 	if symbolMap, err = linker.addSymbolMap(symPtr, codeModule); err == nil {
 		if err = linker.relocate(codeModule, symbolMap); err == nil {
 			if err = linker.buildModule(codeModule, symbolMap); err == nil {
-				MakeThreadJITCodeExecutable(uintptr(codeModule.codeBase), codeModule.maxCodeLength)
-				if err = linker.doInitialize(codeModule, symbolMap); err == nil {
-					return codeModule, err
+				if err = linker.deduplicateTypeDescriptors(codeModule, symbolMap); err == nil {
+					MakeThreadJITCodeExecutable(uintptr(codeModule.codeBase), codeModule.maxCodeLength)
+					if err = linker.doInitialize(codeModule, symbolMap); err == nil {
+						return codeModule, err
+					}
 				}
 			}
 		}

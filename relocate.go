@@ -266,9 +266,6 @@ func (linker *Linker) relocate(codeModule *CodeModule, symbolMap map[string]uint
 	segment := &codeModule.segment
 	byteorder := linker.Arch.ByteOrder
 
-	patchedTypeMethodsIfn := make(map[*_type]map[int]struct{})
-	patchedTypeMethodsTfn := make(map[*_type]map[int]struct{})
-
 	for _, symbol := range linker.symMap {
 		for _, loc := range symbol.Reloc {
 			addr := symbolMap[loc.Sym.Name]
@@ -286,18 +283,12 @@ func (linker *Linker) relocate(codeModule *CodeModule, symbolMap map[string]uint
 					}
 				}
 				if !isTypeWhichShouldNotBeDeduped {
-					if strings.HasPrefix(loc.Sym.Name, TypePrefix) &&
-						!strings.HasPrefix(loc.Sym.Name, TypeDoubleDotPrefix) {
-						t := (*_type)(unsafe.Pointer(fmAddr))
-						prevT := (*_type)(unsafe.Pointer(addr))
-						u := t.uncommon()
-						prevU := prevT.uncommon()
-						err := codeModule.patchTypeMethodOffsets(t, u, prevU, patchedTypeMethodsIfn, patchedTypeMethodsTfn)
-						if err != nil {
-							return err
-						}
+					// Always use the new module types initially - we will later check for type equality and
+					// deduplicate them if they're structurally equal. If we used the firstmodule types here, there's a
+					// risk they're not structurally equal, but it would be too late
+					if !strings.HasPrefix(loc.Sym.Name, TypePrefix) {
+						addr = fmAddr
 					}
-					addr = fmAddr
 				}
 			}
 			sym := loc.Sym
@@ -393,14 +384,5 @@ func (linker *Linker) relocate(codeModule *CodeModule, symbolMap map[string]uint
 			}
 		}
 	}
-
-	codeModule.patchedTypeMethodsIfn = patchedTypeMethodsIfn
-	codeModule.patchedTypeMethodsTfn = patchedTypeMethodsTfn
-
-	if err != nil {
-		return err
-	}
-	err = patchTypeMethodTextPtrs(uintptr(codeModule.codeBase), codeModule.patchedTypeMethodsIfn, codeModule.patchedTypeMethodsTfn)
-
 	return err
 }

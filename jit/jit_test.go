@@ -1583,6 +1583,13 @@ func TestTypeMismatch(t *testing.T) {
 		if reflect.TypeOf(bakedIn) == reflect.TypeOf(dynamic2) {
 			t.Errorf("expected types to be different %p, %p", reflect.TypeOf(bakedIn), reflect.TypeOf(dynamic2))
 		}
+	} else {
+		testFunc3 := reflect.ValueOf(symbols2["New"])
+		result := testFunc3.Call(nil)
+
+		if reflect.TypeOf(bakedIn) == result[0].Type() {
+			t.Errorf("expected types to be different %p, %p", reflect.TypeOf(bakedIn), result[0].Type())
+		}
 	}
 
 	err = module2.Unload()
