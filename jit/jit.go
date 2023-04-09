@@ -25,20 +25,6 @@ import (
 var globalMutex = sync.Mutex{}
 var globalPkgSet = make(map[string]struct{})
 var globalSymPtr = make(map[string]uintptr)
-var stdLibPkgs = map[string]struct{}{}
-
-func init() {
-	// TODO - should make sure that same toolchain version is used across host binary and JIT code...
-	cmd := exec.Command("go", "list", "std")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("goloader/jit failed to list std packages: %s\n", err)
-		return
-	}
-	for _, pkgName := range bytes.Split(output, []byte("\n")) {
-		stdLibPkgs[string(pkgName)] = struct{}{}
-	}
-}
 
 func init() {
 	err := RegisterSymbols()
@@ -161,7 +147,7 @@ func execBuild(config BuildConfig, workDir, outputFilePath string, targets []str
 	return nil
 }
 
-func resolveDependencies(config BuildConfig, workDir, buildDir string, outputFilePath, packageName string, pkg *Package, linkerOpts []goloader.LinkerOptFunc) (*goloader.Linker, error) {
+func resolveDependencies(config BuildConfig, workDir, buildDir string, outputFilePath, packageName string, pkg *Package, linkerOpts []goloader.LinkerOptFunc, stdLibPkgs map[string]struct{}) (*goloader.Linker, error) {
 	// Now check whether all imported packages are available in the main binary, otherwise we need to build and load them too
 	linker, err := goloader.ReadObjs([]string{outputFilePath}, []string{packageName}, linkerOpts...)
 
@@ -193,7 +179,7 @@ func resolveDependencies(config BuildConfig, workDir, buildDir string, outputFil
 		if config.DebugLog {
 			log.Printf("%d unresolved external symbols missing from main binary, will attempt to build dependencies\n", len(externalSymbolsWithoutSkip))
 		}
-		errDeps := buildAndLoadDeps(config, workDir, buildDir, sortedDeps, externalSymbols, externalSymbolsWithoutSkip, seen, &depImportPaths, &depBinaries, 0, linkerOpts)
+		errDeps := buildAndLoadDeps(config, workDir, buildDir, sortedDeps, externalSymbols, externalSymbolsWithoutSkip, seen, &depImportPaths, &depBinaries, 0, linkerOpts, stdLibPkgs)
 		if errDeps != nil {
 			return nil, errDeps
 		}
@@ -299,7 +285,7 @@ func addCGoSymbols(externalUnresolvedSymbols map[string]*obj.Sym) {
 	}
 }
 
-func buildAndLoadDeps(config BuildConfig, workDir, buildDir string, sortedDeps []string, unresolvedSymbols, unresolvedSymbolsWithoutSkip map[string]*obj.Sym, seen map[string]struct{}, builtPackageImportPaths, buildPackageFilePaths *[]string, depth int, linkerOpts []goloader.LinkerOptFunc) error {
+func buildAndLoadDeps(config BuildConfig, workDir, buildDir string, sortedDeps []string, unresolvedSymbols, unresolvedSymbolsWithoutSkip map[string]*obj.Sym, seen map[string]struct{}, builtPackageImportPaths, buildPackageFilePaths *[]string, depth int, linkerOpts []goloader.LinkerOptFunc, stdLibPkgs map[string]struct{}) error {
 	const maxRecursionDepth = 150
 	if depth > maxRecursionDepth {
 		return fmt.Errorf("failed to buildAndLoadDeps: recursion depth %d exceeded maximum of %d", depth, maxRecursionDepth)
@@ -407,7 +393,7 @@ func buildAndLoadDeps(config BuildConfig, workDir, buildDir string, sortedDeps [
 			sort.Strings(missingList)
 			log.Printf("Still have %d unresolved symbols after building dependencies. Recursing further to build: [\n  %s\n]\n", len(nextUnresolvedSymbols), strings.Join(missingList, ",\n  "))
 		}
-		return buildAndLoadDeps(config, workDir, buildDir, newSortedDeps, nextUnresolvedSymbols, nextUnresolvedSymbols, seen, builtPackageImportPaths, buildPackageFilePaths, depth+1, linkerOpts)
+		return buildAndLoadDeps(config, workDir, buildDir, newSortedDeps, nextUnresolvedSymbols, nextUnresolvedSymbols, seen, builtPackageImportPaths, buildPackageFilePaths, depth+1, linkerOpts, stdLibPkgs)
 	}
 	return nil
 }
@@ -541,7 +527,10 @@ func BuildGoFiles(config BuildConfig, pathToGoFile string, extraFiles ...string)
 	if len(config.SkipTypeDeduplicationForPackages) > 0 {
 		linkerOpts = append(linkerOpts, goloader.WithSkipTypeDeduplicationForPackages(config.SkipTypeDeduplicationForPackages))
 	}
-	linker, err := resolveDependencies(config, workDir, buildDir, outputFilePath, pkg.ImportPath, pkg, linkerOpts)
+
+	stdLibPkgs := GoListStd(config.GoBinary)
+
+	linker, err := resolveDependencies(config, workDir, buildDir, outputFilePath, pkg.ImportPath, pkg, linkerOpts, stdLibPkgs)
 	if err != nil {
 		return nil, err
 	}
@@ -651,7 +640,8 @@ func BuildGoText(config BuildConfig, goText string) (*LoadableUnit, error) {
 	if len(config.SkipTypeDeduplicationForPackages) > 0 {
 		linkerOpts = append(linkerOpts, goloader.WithSkipTypeDeduplicationForPackages(config.SkipTypeDeduplicationForPackages))
 	}
-	linker, err := resolveDependencies(config, "", buildDir, outputFilePath, pkg.ImportPath, pkg, linkerOpts)
+	stdLibPkgs := GoListStd(config.GoBinary)
+	linker, err := resolveDependencies(config, "", buildDir, outputFilePath, pkg.ImportPath, pkg, linkerOpts, stdLibPkgs)
 	if err != nil {
 		return nil, err
 	}
@@ -828,7 +818,8 @@ func BuildGoPackage(config BuildConfig, pathToGoPackage string) (*LoadableUnit, 
 		if len(config.SkipTypeDeduplicationForPackages) > 0 {
 			linkerOpts = append(linkerOpts, goloader.WithSkipTypeDeduplicationForPackages(config.SkipTypeDeduplicationForPackages))
 		}
-		linker, err := resolveDependencies(config, buildDir, buildDir, outputFilePath, pkg.ImportPath, pkg, linkerOpts)
+		stdLibPkgs := GoListStd(config.GoBinary)
+		linker, err := resolveDependencies(config, buildDir, buildDir, outputFilePath, pkg.ImportPath, pkg, linkerOpts, stdLibPkgs)
 		if err != nil {
 			return nil, err
 		}
@@ -911,7 +902,8 @@ func BuildGoPackage(config BuildConfig, pathToGoPackage string) (*LoadableUnit, 
 		if len(config.SkipTypeDeduplicationForPackages) > 0 {
 			linkerOpts = append(linkerOpts, goloader.WithSkipTypeDeduplicationForPackages(config.SkipTypeDeduplicationForPackages))
 		}
-		linker, err := resolveDependencies(config, absPath, rootBuildDir, outputFilePath, importPath, pkg, linkerOpts)
+		stdLibPkgs := GoListStd(config.GoBinary)
+		linker, err := resolveDependencies(config, absPath, rootBuildDir, outputFilePath, importPath, pkg, linkerOpts, stdLibPkgs)
 		if err != nil {
 			return nil, err
 		}
