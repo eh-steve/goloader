@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"github.com/eh-steve/goloader"
 	"github.com/eh-steve/goloader/obj"
-	"golang.org/x/tools/go/packages"
 	"io"
 	"log"
 	"os"
@@ -30,12 +29,14 @@ var stdLibPkgs = map[string]struct{}{}
 
 func init() {
 	// TODO - should make sure that same toolchain version is used across host binary and JIT code...
-	pkgs, err := packages.Load(nil, "std")
+	cmd := exec.Command("go", "list", "std")
+	output, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("goloader/jit failed to list std packages\n")
+		log.Printf("goloader/jit failed to list std packages: %s\n", err)
+		return
 	}
-	for _, pkg := range pkgs {
-		stdLibPkgs[pkg.Name] = struct{}{}
+	for _, pkgName := range bytes.Split(output, []byte("\n")) {
+		stdLibPkgs[string(pkgName)] = struct{}{}
 	}
 }
 
