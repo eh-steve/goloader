@@ -272,32 +272,8 @@ func regType(symPtr map[string]uintptr, v reflect.Value) {
 	} else {
 		header := (*emptyInterface)(unsafe.Pointer(&inter))
 		t := header._type
-		pkgpath := t.PkgPath()
-		var element *_type
-		var elementElem *_type
-		if v.Kind() == reflect.Ptr {
-			element = *(**_type)(add(unsafe.Pointer(t), unsafe.Sizeof(_type{})))
-			if element != nil && pkgpath == EmptyString {
-				switch element.Kind() {
-				case reflect.Ptr, reflect.Array, reflect.Slice:
-					elementElem = *(**_type)(add(unsafe.Pointer(element), unsafe.Sizeof(_type{})))
-				}
-				pkgpath = element.PkgPath()
-				if elementElem != nil && pkgpath == EmptyString {
-					pkgpath = elementElem.PkgPath()
-				}
-			}
-		}
-		name := resolveFullyQualifiedSymbolName(t)
-		if element != nil {
-			symPtr[TypePrefix+name[1:]] = uintptr(unsafe.Pointer(element))
-			if elementElem != nil {
-				symPtr[TypePrefix+name[2:]] = uintptr(unsafe.Pointer(elementElem))
-			}
-		}
-		symPtr[TypePrefix+name] = uintptr(unsafe.Pointer(header._type))
+		registerType(t, symPtr, map[string]struct{}{})
 	}
-
 }
 
 func buildModuleTypeHash(module *moduledata, typeHash map[uint32][]*_type) {
