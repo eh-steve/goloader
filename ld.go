@@ -953,7 +953,7 @@ func (linker *Linker) deduplicateTypeDescriptors(codeModule *CodeModule, symbolM
 	return err
 }
 
-func (linker *Linker) UnresolvedExternalSymbols(symbolMap map[string]uintptr, ignorePackages []string) map[string]*obj.Sym {
+func (linker *Linker) UnresolvedExternalSymbols(symbolMap map[string]uintptr, ignorePackages []string, stdLibPkgs map[string]struct{}) map[string]*obj.Sym {
 	symMap := make(map[string]*obj.Sym)
 	for symName, sym := range linker.symMap {
 		shouldSkipDedup := false
@@ -963,10 +963,18 @@ func (linker *Linker) UnresolvedExternalSymbols(symbolMap map[string]uintptr, ig
 			}
 		}
 		if sym.Offset == InvalidOffset || shouldSkipDedup {
-			if strings.HasPrefix(symName, TypePrefix) {
-				// Always force the rebuild of types in case they've changed between firstmodule and JIT code
+			if strings.HasPrefix(symName, TypePrefix) &&
+				!strings.HasPrefix(symName, TypeDoubleDotPrefix) {
+				// Always force the rebuild of non-std lib types in case they've changed between firstmodule and JIT code
 				// They can be checked for structural equality if the JIT code builds it, but not if we blindly use the firstmodule version of a _type
-				symMap[symName] = sym
+				if typeSym, ok := symbolMap[symName]; ok {
+					t := (*_type)(unsafe.Pointer(typeSym))
+					_, isStdLibPkg := stdLibPkgs[t.PkgPath()]
+					// Don't rebuild types in the stdlib, as these shouldn't be different (assuming same toolchain version for host and JIT)
+					if t.PkgPath() != "" && !isStdLibPkg {
+						symMap[symName] = sym
+					}
+				}
 			}
 			if _, ok := symbolMap[symName]; !ok || shouldSkipDedup {
 				if _, ok := linker.objsymbolMap[symName]; !ok || shouldSkipDedup {

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"github.com/eh-steve/goloader"
 	"github.com/eh-steve/goloader/obj"
+	"golang.org/x/tools/go/packages"
 	"io"
 	"log"
 	"os"
@@ -25,6 +26,18 @@ import (
 var globalMutex = sync.Mutex{}
 var globalPkgSet = make(map[string]struct{})
 var globalSymPtr = make(map[string]uintptr)
+var stdLibPkgs = map[string]struct{}{}
+
+func init() {
+	// TODO - should make sure that same toolchain version is used across host binary and JIT code...
+	pkgs, err := packages.Load(nil, "std")
+	if err != nil {
+		log.Printf("goloader/jit failed to list std packages\n")
+	}
+	for _, pkg := range pkgs {
+		stdLibPkgs[pkg.Name] = struct{}{}
+	}
+}
 
 func init() {
 	err := RegisterSymbols()
@@ -156,8 +169,8 @@ func resolveDependencies(config BuildConfig, workDir, buildDir string, outputFil
 	}
 
 	globalMutex.Lock()
-	externalSymbols := linker.UnresolvedExternalSymbols(globalSymPtr, config.SkipTypeDeduplicationForPackages)
-	externalSymbolsWithoutSkip := linker.UnresolvedExternalSymbols(globalSymPtr, nil)
+	externalSymbols := linker.UnresolvedExternalSymbols(globalSymPtr, config.SkipTypeDeduplicationForPackages, stdLibPkgs)
+	externalSymbolsWithoutSkip := linker.UnresolvedExternalSymbols(globalSymPtr, nil, stdLibPkgs)
 	externalPackages := linker.UnresolvedPackageReferences(pkg.Deps)
 	globalMutex.Unlock()
 
@@ -368,7 +381,7 @@ func buildAndLoadDeps(config BuildConfig, workDir, buildDir string, sortedDeps [
 	}
 
 	globalMutex.Lock()
-	nextUnresolvedSymbols := linker.UnresolvedExternalSymbols(globalSymPtr, nil)
+	nextUnresolvedSymbols := linker.UnresolvedExternalSymbols(globalSymPtr, nil, stdLibPkgs)
 	globalMutex.Unlock()
 
 	addCGoSymbols(nextUnresolvedSymbols)
