@@ -156,6 +156,8 @@ func check() {
 	var _ = reflect.MapOf(reflect.TypeOf(5), reflect.TypeOf(5))
 	var _ = reflect.ArrayOf(1, reflect.TypeOf(5))
 	var _ = reflect.Append(reflect.ValueOf([]int{}))
+	x := 0
+	var _ = reflect.NewAt(reflect.TypeOf(0), reflect.ValueOf(&x).UnsafePointer())
 	// reflect.Call disables most of linker's deadcode analysis $GOROOT/src/cmd/link/internal/ld/deadcode.go
 	var _ = reflect.MakeFunc(reflect.TypeOf(func() {}), func(args []reflect.Value) (results []reflect.Value) {
 		return nil

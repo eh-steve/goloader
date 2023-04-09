@@ -868,7 +868,8 @@ func (linker *Linker) deduplicateTypeDescriptors(codeModule *CodeModule, symbolM
 
 				// Only relocate code if the type is a duplicate
 				if t != prevT {
-					if uintptr(unsafe.Pointer(t)) != symbolMap[FirstModulePrefix+loc.Sym.Name] {
+					_, isVariant := symbolIsVariant(loc.Sym.Name)
+					if uintptr(unsafe.Pointer(t)) != symbolMap[FirstModulePrefix+loc.Sym.Name] && !isVariant {
 						// This shouldn't be possible and indicates a registration bug
 						panic(fmt.Sprintf("found another firstmodule type that wasn't registered by goloader: %s", loc.Sym.Name))
 					}

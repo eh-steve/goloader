@@ -209,7 +209,7 @@ func resolveFullyQualifiedSymbolName(t *_type) string {
 
 func symbolIsVariant(name string) (string, bool) {
 	// need to double check for function scoped types which get a ·N suffix added, and also type.noalg.* variants
-	const noAlgPrefix = TypePrefix + "noalg" + ObjSymbolSeparator
+	const noAlgPrefix = TypePrefix + "noalg."
 	i := len(name)
 	for i > 0 && name[i-1] >= '0' && name[i-1] <= '9' {
 		i--
