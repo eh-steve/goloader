@@ -110,7 +110,7 @@ func (t *_type) Elem() *_type               { return _Elem(t) }
 //	import "github.com/org/somepackage/v4" + somepackage.SomeStruct
 //	 =>  github.com/org/somepackage/v4.SomeStruct
 func resolveFullyQualifiedSymbolName(t *_type) string {
-	typ := AsType(t)
+	typ := AsRType(t)
 	pkgPath := objabi.PathToPrefix(typ.PkgPath())
 	name := typ.Name()
 	if pkgPath != "" && name != "" {
@@ -118,7 +118,7 @@ func resolveFullyQualifiedSymbolName(t *_type) string {
 	}
 	switch t.Kind() {
 	case reflect.Ptr:
-		return "*" + resolveFullyQualifiedSymbolName(toType(typ.Elem()))
+		return "*" + resolveFullyQualifiedSymbolName(fromRType(typ.Elem()))
 	case reflect.Struct:
 		if typ.NumField() == 0 {
 			return typ.String()
@@ -131,37 +131,41 @@ func resolveFullyQualifiedSymbolName(t *_type) string {
 			}
 			fieldPkgPath := ""
 			if typ.Field(i).PkgPath != "" {
-				fieldPkgPath = typ.Field(i).PkgPath + "."
+				fieldPkgPath = objabi.PathToPrefix(typ.Field(i).PkgPath) + "."
 			}
-			fields[i] = fmt.Sprintf("%s%s%s", fieldPkgPath, fieldName, resolveFullyQualifiedSymbolName(toType(typ.Field(i).Type)))
+			fieldStructTag := ""
+			if typ.Field(i).Tag != "" {
+				fieldStructTag = fmt.Sprintf(" %q", string(typ.Field(i).Tag))
+			}
+			fields[i] = fmt.Sprintf("%s%s%s%s", fieldPkgPath, fieldName, resolveFullyQualifiedSymbolName(fromRType(typ.Field(i).Type)), fieldStructTag)
 		}
 		return fmt.Sprintf("struct { %s }", strings.Join(fields, "; "))
 	case reflect.Map:
-		return fmt.Sprintf("map[%s]%s", resolveFullyQualifiedSymbolName(toType(typ.Key())), resolveFullyQualifiedSymbolName(toType(typ.Elem())))
+		return fmt.Sprintf("map[%s]%s", resolveFullyQualifiedSymbolName(fromRType(typ.Key())), resolveFullyQualifiedSymbolName(fromRType(typ.Elem())))
 	case reflect.Chan:
 		switch reflect.ChanDir(typ.ChanDir()) {
 		case reflect.BothDir:
-			return fmt.Sprintf("chan %s", resolveFullyQualifiedSymbolName(toType(typ.Elem())))
+			return fmt.Sprintf("chan %s", resolveFullyQualifiedSymbolName(fromRType(typ.Elem())))
 		case reflect.RecvDir:
-			return fmt.Sprintf("<-chan %s", resolveFullyQualifiedSymbolName(toType(typ.Elem())))
+			return fmt.Sprintf("<-chan %s", resolveFullyQualifiedSymbolName(fromRType(typ.Elem())))
 		case reflect.SendDir:
-			return fmt.Sprintf("chan<- %s", resolveFullyQualifiedSymbolName(toType(typ.Elem())))
+			return fmt.Sprintf("chan<- %s", resolveFullyQualifiedSymbolName(fromRType(typ.Elem())))
 		}
 	case reflect.Slice:
-		return fmt.Sprintf("[]%s", resolveFullyQualifiedSymbolName(toType(typ.Elem())))
+		return fmt.Sprintf("[]%s", resolveFullyQualifiedSymbolName(fromRType(typ.Elem())))
 	case reflect.Array:
-		return fmt.Sprintf("[%d]%s", typ.Len(), resolveFullyQualifiedSymbolName(toType(typ.Elem())))
+		return fmt.Sprintf("[%d]%s", typ.Len(), resolveFullyQualifiedSymbolName(fromRType(typ.Elem())))
 	case reflect.Func:
 		ins := make([]string, typ.NumIn())
 		outs := make([]string, typ.NumOut())
 		for i := 0; i < typ.NumIn(); i++ {
-			ins[i] = resolveFullyQualifiedSymbolName(toType(typ.In(i)))
+			ins[i] = resolveFullyQualifiedSymbolName(fromRType(typ.In(i)))
 			if i == typ.NumIn()-1 && typ.IsVariadic() {
-				ins[i] = "..." + resolveFullyQualifiedSymbolName(toType(typ.In(i).Elem()))
+				ins[i] = "..." + resolveFullyQualifiedSymbolName(fromRType(typ.In(i).Elem()))
 			}
 		}
 		for i := 0; i < typ.NumOut(); i++ {
-			outs[i] = resolveFullyQualifiedSymbolName(toType(typ.Out(i)))
+			outs[i] = resolveFullyQualifiedSymbolName(fromRType(typ.Out(i)))
 		}
 		funcName := "func(" + strings.Join(ins, ", ") + ")"
 		if len(outs) > 0 {
@@ -208,20 +212,74 @@ func resolveFullyQualifiedSymbolName(t *_type) string {
 }
 
 func symbolIsVariant(name string) (string, bool) {
-	// need to double check for function scoped types which get a ·N suffix added, and also type.noalg.* variants
-	const noAlgPrefix = TypePrefix + "noalg."
-	i := len(name)
-	for i > 0 && name[i-1] >= '0' && name[i-1] <= '9' {
-		i--
-	}
 	const dot = "·"
+	const noAlgPrefix = TypePrefix + "noalg."
+	if strings.HasPrefix(name, TypePrefix+"struct {") || strings.HasPrefix(name, TypePrefix+"*struct {") {
+		// Anonymous structs might embed variant types, so these will need parsing first
+		ptr := false
+		if strings.HasPrefix(name, TypePrefix+"*struct {") {
+			ptr = true
+		}
+		fieldsStr := strings.TrimPrefix(name, TypePrefix+"struct { ")
+		fieldsStr = strings.TrimPrefix(name, TypePrefix+"*struct { ")
+		fieldsStr = strings.TrimSuffix(fieldsStr, " }")
+		fields := strings.Split(fieldsStr, "; ")
+		isVariant := false
+		for j, field := range fields {
+			var typeName string
+			var typeNameIndex int
+			fieldTypeTag := strings.SplitN(field, " ", 3)
+			// could be anonymous, or tagless, or both - we want to operate on the type
+			switch len(fieldTypeTag) {
+			case 1:
+				// Anonymous, tagless - just a type
+				typeName = fieldTypeTag[0]
+			case 2:
+				// could be a name + type, or type + tag
+				if strings.HasPrefix(fieldTypeTag[1], "\"") || strings.HasPrefix(fieldTypeTag[1], "`") {
+					// type + tag
+					typeName = fieldTypeTag[0]
+				} else {
+					// name + type
+					typeName = fieldTypeTag[1]
+					typeNameIndex = 1
+				}
+			case 3:
+				// Name + type + tag
+				typeName = fieldTypeTag[1]
+				typeNameIndex = 1
+			}
+			i := len(typeName)
+			for i > 0 && typeName[i-1] >= '0' && typeName[i-1] <= '9' {
+				i--
+			}
+			if i >= len(dot) && typeName[i-len(dot):i] == dot {
+				isVariant = true
+				fieldTypeTag[typeNameIndex] = typeName[:i-len(dot)]
+				fields[j] = strings.Join(fieldTypeTag, " ")
+			}
+		}
+		if isVariant {
+			if ptr {
+				return TypePrefix + "*struct { " + strings.Join(fields, "; ") + " }", true
+			}
+			return TypePrefix + "struct { " + strings.Join(fields, "; ") + " }", true
 
-	if i >= len(dot) && name[i-len(dot):i] == dot {
-		return name[:i-len(dot)], true
-	} else if strings.HasPrefix(name, noAlgPrefix) {
-		return TypePrefix + strings.TrimPrefix(name, noAlgPrefix), true
+		}
+		return "", false
+	} else {
+		// need to double check for function scoped types which get a ·N suffix added, and also type.noalg.* variants
+		i := len(name)
+		for i > 0 && name[i-1] >= '0' && name[i-1] <= '9' {
+			i--
+		}
+		if i >= len(dot) && name[i-len(dot):i] == dot {
+			return name[:i-len(dot)], true
+		} else if strings.HasPrefix(name, noAlgPrefix) {
+			return TypePrefix + strings.TrimPrefix(name, noAlgPrefix), true
+		}
+		return "", false
 	}
-	return "", false
 }
 
 func funcPkgPath(funcName string) string {
