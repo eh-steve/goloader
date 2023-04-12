@@ -283,6 +283,7 @@ func symbolIsVariant(name string) (string, bool) {
 }
 
 func funcPkgPath(funcName string) string {
+	funcName = strings.TrimPrefix(funcName, TypeDoubleDotPrefix+"eq.")
 	// Anonymous struct methods can't have a package
 	if strings.HasPrefix(funcName, "go"+ObjSymbolSeparator+"struct {") || strings.HasPrefix(funcName, "go"+ObjSymbolSeparator+"(*struct {") {
 		return ""
@@ -291,15 +292,20 @@ func funcPkgPath(funcName string) string {
 	if lastSlash == -1 {
 		lastSlash = 0
 	}
-	// Methods on structs embedding structs from other packages look funny, e.g.:
-	// regexp.(*onePassInst).regexp/syntax.op
-	firstBracket := strings.LastIndex(funcName, ".(")
-	if firstBracket > 0 && lastSlash > firstBracket {
-		lastSlash = firstBracket
+	// Generic dictionaries
+	firstDict := strings.Index(funcName, "..dict")
+	if firstDict > 0 {
+		return funcName[:firstDict]
+	} else {
+		// Methods on structs embedding structs from other packages look funny, e.g.:
+		// regexp.(*onePassInst).regexp/syntax.op
+		firstBracket := strings.LastIndex(funcName, ".(")
+		if firstBracket > 0 && lastSlash > firstBracket {
+			lastSlash = firstBracket
+		}
 	}
-
 	dot := lastSlash
-	for ; dot < len(funcName) && funcName[dot] != '.' && funcName[dot] != '('; dot++ {
+	for ; dot < len(funcName) && funcName[dot] != '.' && funcName[dot] != '(' && funcName[dot] != '['; dot++ {
 	}
 	pkgPath := funcName[:dot]
 	return strings.TrimPrefix(strings.TrimPrefix(pkgPath, TypePrefix+".eq."), "[...]")

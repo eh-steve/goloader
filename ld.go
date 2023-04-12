@@ -65,6 +65,7 @@ type Linker struct {
 	appliedADRPRelocs      map[*byte][]byte
 	appliedPCRelRelocs     map[*byte][]byte
 	pkgNamesWithUnresolved map[string]struct{}
+	reachableTypes         map[string]struct{}
 }
 
 type CodeModule struct {
@@ -103,6 +104,7 @@ func initLinker(opts []LinkerOptFunc) (*Linker, error) {
 		appliedADRPRelocs:      make(map[*byte][]byte),
 		appliedPCRelRelocs:     make(map[*byte][]byte),
 		pkgNamesWithUnresolved: make(map[string]struct{}),
+		reachableTypes:         make(map[string]struct{}),
 	}
 	linker.Opts(opts...)
 	c := &linker.options
@@ -221,7 +223,7 @@ func (linker *Linker) addSymbol(name string) (symbol *obj.Sym, err error) {
 		return symbol, nil
 	}
 	objsym := linker.objsymbolMap[name]
-	symbol = &obj.Sym{Name: objsym.Name, Kind: objsym.Kind}
+	symbol = &obj.Sym{Name: objsym.Name, Kind: objsym.Kind, Pkg: objsym.Pkg}
 	linker.symMap[symbol.Name] = symbol
 
 	switch symbol.Kind {
@@ -426,7 +428,7 @@ func (linker *Linker) addSymbol(name string) (symbol *obj.Sym, err error) {
 	if objsym.Type != EmptyString {
 		if _, ok := linker.symMap[objsym.Type]; !ok {
 			if _, ok := linker.objsymbolMap[objsym.Type]; !ok {
-				linker.symMap[objsym.Type] = &obj.Sym{Name: objsym.Type, Offset: InvalidOffset}
+				linker.symMap[objsym.Type] = &obj.Sym{Name: objsym.Type, Offset: InvalidOffset, Pkg: objsym.Pkg}
 			}
 		}
 	}
@@ -972,7 +974,10 @@ func (linker *Linker) UnresolvedExternalSymbols(symbolMap map[string]uintptr, ig
 					_, isStdLibPkg := stdLibPkgs[t.PkgPath()]
 					// Don't rebuild types in the stdlib, as these shouldn't be different (assuming same toolchain version for host and JIT)
 					if t.PkgPath() != "" && !isStdLibPkg {
-						symMap[symName] = sym
+						// Only rebuild types which are reachable (via relocs) from the main package, otherwise we'll end up building everything unnecessarily
+						if _, ok := linker.reachableTypes[symName]; ok {
+							symMap[symName] = sym
+						}
 					}
 				}
 			}
