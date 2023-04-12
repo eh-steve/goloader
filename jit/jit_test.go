@@ -11,6 +11,7 @@ import (
 	"github.com/eh-steve/goloader/jit/testdata/test_issue55/p"
 	"github.com/eh-steve/goloader/jit/testdata/test_type_mismatch"
 	"github.com/eh-steve/goloader/jit/testdata/test_type_mismatch/typedef"
+	"github.com/eh-steve/goloader/unload/jsonunload"
 	"net"
 	"net/http"
 	"os"
@@ -185,7 +186,6 @@ func TestJitJsonUnmarshal(t *testing.T) {
 	for _, testName := range testNames {
 		t.Run(testName, func(t *testing.T) {
 			module, symbols := buildLoadable(t, conf, testName, data)
-
 			MyFunc := symbols["MyFunc"].(func([]byte) (interface{}, error))
 			result, err := MyFunc([]byte(`{"key": "value"}`))
 			if err != nil {
@@ -194,7 +194,7 @@ func TestJitJsonUnmarshal(t *testing.T) {
 			if result.(map[string]interface{})["key"] != "value" {
 				t.Errorf("expected %s, got %v", "value", result)
 			}
-
+			jsonunload.Unload(module.DataAddr())
 			err = module.Unload()
 			if err != nil {
 				t.Fatal(err)
@@ -1519,16 +1519,16 @@ func TestGCGlobals(t *testing.T) {
 
 func TestTypeMismatch(t *testing.T) {
 	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              nil,
-		TmpDir:                "",
-		DebugLog:              false,
-		HeapStrings:           heapStrings,
-		StringContainerSize:   stringContainerSize,
-		RandomSymbolNameOrder: false,
-		//RelocationDebugWriter:            os.Stderr,
+		GoBinary:                         goBinary,
+		KeepTempFiles:                    false,
+		ExtraBuildFlags:                  nil,
+		BuildEnv:                         nil,
+		TmpDir:                           "",
+		DebugLog:                         false,
+		HeapStrings:                      heapStrings,
+		StringContainerSize:              stringContainerSize,
+		RandomSymbolNameOrder:            false,
+		UnsafeBlindlyUseFirstmoduleTypes: false, // If set to true, this test should fail (fault)
 	}
 
 	data := testData{

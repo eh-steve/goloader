@@ -111,6 +111,7 @@ type BuildConfig struct {
 	RandomSymbolNameOrder            bool     // Randomise the order of linker symbols (may identify linker bugs)
 	RelocationDebugWriter            io.Writer
 	SkipTypeDeduplicationForPackages []string
+	UnsafeBlindlyUseFirstmoduleTypes bool
 }
 
 func execBuild(config BuildConfig, workDir, outputFilePath string, targets []string) error {
@@ -157,8 +158,8 @@ func resolveDependencies(config BuildConfig, workDir, buildDir string, outputFil
 	}
 
 	globalMutex.Lock()
-	externalSymbols := linker.UnresolvedExternalSymbols(globalSymPtr, config.SkipTypeDeduplicationForPackages, stdLibPkgs)
-	externalSymbolsWithoutSkip := linker.UnresolvedExternalSymbols(globalSymPtr, nil, stdLibPkgs)
+	externalSymbols := linker.UnresolvedExternalSymbols(globalSymPtr, config.SkipTypeDeduplicationForPackages, stdLibPkgs, config.UnsafeBlindlyUseFirstmoduleTypes)
+	externalSymbolsWithoutSkip := linker.UnresolvedExternalSymbols(globalSymPtr, nil, stdLibPkgs, config.UnsafeBlindlyUseFirstmoduleTypes)
 	externalPackages := linker.UnresolvedPackageReferences(pkg.Deps)
 	globalMutex.Unlock()
 
@@ -376,7 +377,7 @@ func buildAndLoadDeps(config BuildConfig,
 	}
 
 	globalMutex.Lock()
-	nextUnresolvedSymbols := linker.UnresolvedExternalSymbols(globalSymPtr, nil, stdLibPkgs)
+	nextUnresolvedSymbols := linker.UnresolvedExternalSymbols(globalSymPtr, nil, stdLibPkgs, config.UnsafeBlindlyUseFirstmoduleTypes)
 	globalMutex.Unlock()
 
 	addCGoSymbols(nextUnresolvedSymbols)

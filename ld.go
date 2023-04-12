@@ -955,12 +955,12 @@ func (linker *Linker) deduplicateTypeDescriptors(codeModule *CodeModule, symbolM
 	return err
 }
 
-func (linker *Linker) UnresolvedExternalSymbols(symbolMap map[string]uintptr, ignorePackages []string, stdLibPkgs map[string]struct{}) map[string]*obj.Sym {
+func (linker *Linker) UnresolvedExternalSymbols(symbolMap map[string]uintptr, ignorePackages []string, stdLibPkgs map[string]struct{}, unsafeBlindlyUseFirstModuleTypes bool) map[string]*obj.Sym {
 	symMap := make(map[string]*obj.Sym)
 	for symName, sym := range linker.symMap {
 		shouldSkipDedup := false
 		for _, pkgPath := range ignorePackages {
-			if strings.HasPrefix(symName, pkgPath) {
+			if sym.Pkg == pkgPath {
 				shouldSkipDedup = true
 			}
 		}
@@ -975,7 +975,7 @@ func (linker *Linker) UnresolvedExternalSymbols(symbolMap map[string]uintptr, ig
 					// Don't rebuild types in the stdlib, as these shouldn't be different (assuming same toolchain version for host and JIT)
 					if t.PkgPath() != "" && !isStdLibPkg {
 						// Only rebuild types which are reachable (via relocs) from the main package, otherwise we'll end up building everything unnecessarily
-						if _, ok := linker.reachableTypes[symName]; ok {
+						if _, ok := linker.reachableTypes[symName]; ok && !unsafeBlindlyUseFirstModuleTypes {
 							symMap[symName] = sym
 						}
 					}
