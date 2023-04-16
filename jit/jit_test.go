@@ -1074,13 +1074,13 @@ func TestConvertOldAndNewTypes(t *testing.T) {
 			ifaceCounter1 := ifaceOut1.Val2["exclusive_interface_counter"].(string)
 			byteReader1 := ifaceOut1.Val2["bytes_reader_output"].([]byte)
 			ifaceCurrent1 := ifaceOut1.Val2["current"].(int64)
-			ifaceCurrentComplex1 := ifaceOut1.Val2["complex"].(map[string]interface{})
+			ifaceCurrentComplex1 := ifaceOut1.Val2["complex"].(map[interface{}]interface{})
 
 			ifaceOut12, _ := thingIface1.Method1(common.SomeStruct{Val1: []byte{4, 5, 6}, Val2: map[string]interface{}{}})
 			ifaceCounter12 := ifaceOut12.Val2["exclusive_interface_counter"].(string)
 			byteReader12 := ifaceOut12.Val2["bytes_reader_output"].([]byte)
 			ifaceCurrent12 := ifaceOut12.Val2["current"].(int64)
-			ifaceCurrentComplex12 := ifaceOut12.Val2["complex"].(map[string]interface{})
+			ifaceCurrentComplex12 := ifaceOut12.Val2["complex"].(map[interface{}]interface{})
 			_ = thingIface1.Method2(nil)
 
 			newThingIface2, err := goloader.ConvertTypesAcrossModules(module1, module2, thingIface1, thingIface2)
