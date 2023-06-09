@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"runtime"
 	"sort"
@@ -64,8 +65,11 @@ type Linker struct {
 	appliedADRPRelocs      map[*byte][]byte
 	appliedPCRelRelocs     map[*byte][]byte
 	pkgNamesWithUnresolved map[string]struct{}
+	pkgNamesToForceRebuild map[string]struct{}
 	reachableTypes         map[string]struct{}
+	reachableSymbols       map[string]struct{}
 	pkgs                   []*obj.Pkg
+	pkgsByName             map[string]*obj.Pkg
 }
 
 type CodeModule struct {
@@ -105,7 +109,12 @@ func initLinker(opts []LinkerOptFunc) (*Linker, error) {
 		appliedADRPRelocs:      make(map[*byte][]byte),
 		appliedPCRelRelocs:     make(map[*byte][]byte),
 		pkgNamesWithUnresolved: make(map[string]struct{}),
+		pkgNamesToForceRebuild: make(map[string]struct{}),
 		reachableTypes:         make(map[string]struct{}),
+		reachableSymbols:       make(map[string]struct{}),
+	}
+	if os.Getenv("GOLOADER_FORCE_TEST_RELOCATION_EPILOGUES") == "1" {
+		opts = append(opts, WithForceTestRelocationEpilogues())
 	}
 	linker.Opts(opts...)
 
@@ -116,13 +125,48 @@ func initLinker(opts []LinkerOptFunc) (*Linker, error) {
 	return linker, nil
 }
 
+func (linker *Linker) Autolib() []string {
+	// Sort dependent packages into autolib order via depth first recursion
+	if len(linker.pkgs) == 0 {
+		return nil
+	}
+	seen := map[string]struct{}{}
+	var autolibsByPkg = map[string][]string{}
+	for _, pkg := range linker.pkgs {
+		autolibsByPkg[pkg.PkgPath] = pkg.AutoLib
+	}
+	// The last package is the main package, so start there
+	mainPkg := linker.pkgs[len(linker.pkgs)-1]
+	var autolibs []string
+	recurseAutolibs(autolibsByPkg, mainPkg.PkgPath, &autolibs, seen)
+
+	return autolibs
+}
+
+func recurseAutolibs(autolibsByPkg map[string][]string, targetPkg string, autolibs *[]string, seen map[string]struct{}) {
+	if _, ok := seen[targetPkg]; ok {
+		return
+	}
+	seen[targetPkg] = struct{}{}
+	for _, imported := range autolibsByPkg[targetPkg] {
+		recurseAutolibs(autolibsByPkg, imported, autolibs, seen)
+		newLibs := autolibsByPkg[imported]
+		for _, newLib := range newLibs {
+			if _, ok := seen[newLib]; !ok {
+				*autolibs = append(*autolibs, newLib)
+			}
+		}
+	}
+	*autolibs = append(*autolibs, targetPkg)
+}
+
 func (linker *Linker) Opts(linkerOpts ...LinkerOptFunc) {
 	for _, opt := range linkerOpts {
 		opt(&linker.options)
 	}
 }
 
-func (linker *Linker) addSymbols(symbolNames []string) error {
+func (linker *Linker) addSymbols(symbolNames []string, globalSymPtr map[string]uintptr) error {
 	// static_tmp is 0, golang compile not allocate memory.
 	linker.noptrdata = append(linker.noptrdata, make([]byte, IntSize)...)
 
@@ -141,9 +185,28 @@ func (linker *Linker) addSymbols(symbolNames []string) error {
 	}
 
 	for _, objSymName := range symbolNames {
+		if _, ok := linker.symMap[objSymName]; ok {
+			continue
+		}
+		if !linker.isSymbolReachable(objSymName) {
+			continue
+		}
+
 		objSym := linker.objsymbolMap[objSymName]
+		if objSym == nil {
+			// Might have been added as an ABI wrapper without the actual implementation
+			objSym = linker.objsymbolMap[objSymName+obj.ABI0Suffix]
+			if objSym != nil {
+				panic("missing a symbol " + objSymName + " but found its ABI0 wrapper")
+			} else {
+				objSym = linker.objsymbolMap[objSymName+obj.ABIInternalSuffix]
+				if objSym != nil {
+					panic("missing a symbol " + objSymName + " but found its ABIInternal wrapper")
+				}
+			}
+		}
 		if objSym.Kind == symkind.STEXT && objSym.DupOK == false {
-			_, err := linker.addSymbol(objSym.Name)
+			_, err := linker.addSymbol(objSym.Name, globalSymPtr)
 			if err != nil {
 				return err
 			}
@@ -162,7 +225,7 @@ func (linker *Linker) addSymbols(symbolNames []string) error {
 			}
 			if isAsmWrapper {
 				// This wrapper's symbol has a suffix of .abiinternal to distinguish it from the abi0 ASM func
-				_, err := linker.addSymbol(objSym.Name)
+				_, err := linker.addSymbol(objSym.Name, globalSymPtr)
 				if err != nil {
 					return err
 				}
@@ -170,7 +233,7 @@ func (linker *Linker) addSymbols(symbolNames []string) error {
 		}
 		switch objSym.Kind {
 		case symkind.SNOPTRDATA, symkind.SRODATA, symkind.SDATA, symkind.SBSS, symkind.SNOPTRBSS:
-			_, err := linker.addSymbol(objSym.Name)
+			_, err := linker.addSymbol(objSym.Name, globalSymPtr)
 			if err != nil {
 				return err
 			}
@@ -208,7 +271,7 @@ func (linker *Linker) SymbolOrder() []string {
 	return linker.symNameOrder
 }
 
-func (linker *Linker) addSymbol(name string) (symbol *obj.Sym, err error) {
+func (linker *Linker) addSymbol(name string, globalSymPtr map[string]uintptr) (symbol *obj.Sym, err error) {
 	if symbol, ok := linker.symMap[name]; ok {
 		return symbol, nil
 	}
@@ -220,11 +283,7 @@ func (linker *Linker) addSymbol(name string) (symbol *obj.Sym, err error) {
 	case symkind.STEXT:
 		symbol.Offset = len(linker.code)
 		linker.code = append(linker.code, objsym.Data...)
-		if linker.Arch.Family == sys.ARM64 {
-			bytearrayAlign(&linker.code, PtrSize)
-		} else {
-			bytearrayAlign(&linker.code, Uint32Size)
-		}
+		bytearrayAlignNops(linker.Arch, &linker.code, PtrSize)
 		for i, reloc := range objsym.Reloc {
 			// Pessimistically pad the function text with extra bytes for any relocations which might add extra
 			// instructions at the end in the case of a 32 bit overflow. These epilogue PCs need to be added to
@@ -238,59 +297,73 @@ func (linker *Linker) addSymbol(name string) (symbol *obj.Sym, err error) {
 			case reloctype.R_ADDRARM64:
 				objsym.Reloc[i].EpilogueOffset = len(linker.code) - symbol.Offset
 				objsym.Reloc[i].EpilogueSize = maxExtraInstructionBytesADRP
-				linker.code = append(linker.code, make([]byte, maxExtraInstructionBytesADRP)...)
+				linker.code = append(linker.code, createArchNops(linker.Arch, maxExtraInstructionBytesADRP)...)
 			case reloctype.R_ARM64_PCREL_LDST8, reloctype.R_ARM64_PCREL_LDST16, reloctype.R_ARM64_PCREL_LDST32, reloctype.R_ARM64_PCREL_LDST64:
 				objsym.Reloc[i].EpilogueOffset = len(linker.code) - symbol.Offset
 				objsym.Reloc[i].EpilogueSize = maxExtraInstructionBytesADRPLDST
-				linker.code = append(linker.code, make([]byte, maxExtraInstructionBytesADRPLDST)...)
+				linker.code = append(linker.code, createArchNops(linker.Arch, maxExtraInstructionBytesADRPLDST)...)
 			case reloctype.R_CALLARM64:
 				objsym.Reloc[i].EpilogueOffset = alignof(len(linker.code)-symbol.Offset, PtrSize)
 				objsym.Reloc[i].EpilogueSize = maxExtraInstructionBytesCALLARM64
 				alignment := alignof(len(linker.code)-symbol.Offset, PtrSize) - (len(linker.code) - symbol.Offset)
-				linker.code = append(linker.code, make([]byte, maxExtraInstructionBytesCALLARM64+alignment)...)
+				linker.code = append(linker.code, createArchNops(linker.Arch, maxExtraInstructionBytesCALLARM64+alignment)...)
 			case reloctype.R_PCREL:
 				objsym.Reloc[i].EpilogueOffset = len(linker.code) - symbol.Offset
 				instructionBytes := objsym.Data[reloc.Offset-2 : reloc.Offset+reloc.Size]
-				shortJmp := (objsym.Reloc[i].EpilogueOffset - (reloc.Offset + reloc.Size)) < 128
 				opcode := instructionBytes[0]
 				var epilogueSize int
 				switch opcode {
 				case x86amd64LEAcode:
 					epilogueSize = maxExtraInstructionBytesPCRELxLEAQ
 				case x86amd64MOVcode:
+					epilogueSize = maxExtraInstructionBytesPCRELxMOVNear
+				case x86amd64CMPLcode:
+					epilogueSize = maxExtraInstructionBytesPCRELxCMPLNear
+				default:
+					switch instructionBytes[1] {
+					case x86amd64CALLcode:
+						epilogueSize = maxExtraInstructionBytesPCRELxCALLNear
+					case x86amd64JMPcode:
+						epilogueSize = maxExtraInstructionBytesPCRELxJMP
+					}
+				}
+				returnOffset := (reloc.Offset + reloc.Size) - (objsym.Reloc[i].EpilogueOffset + epilogueSize) - len(x86amd64JMPShortCode) //  assumes short jump, adjusts if not
+				shortJmp := returnOffset < 0 && returnOffset > -0x80
+				switch opcode {
+				case x86amd64MOVcode:
 					if shortJmp {
 						epilogueSize = maxExtraInstructionBytesPCRELxMOVShort
-					} else {
-						epilogueSize = maxExtraInstructionBytesPCRELxMOVNear
 					}
 				case x86amd64CMPLcode:
 					if shortJmp {
 						epilogueSize = maxExtraInstructionBytesPCRELxCMPLShort
-					} else {
-						epilogueSize = maxExtraInstructionBytesPCRELxCMPLNear
 					}
 				default:
 					switch instructionBytes[1] {
 					case x86amd64CALLcode:
 						if shortJmp {
 							epilogueSize = maxExtraInstructionBytesPCRELxCALLShort
-						} else {
-							epilogueSize = maxExtraInstructionBytesPCRELxCALLNear
 						}
-					case x86amd64JMPcode:
-						epilogueSize = maxExtraInstructionBytesPCRELxJMP
 					}
 				}
 				objsym.Reloc[i].EpilogueSize = epilogueSize
-				linker.code = append(linker.code, make([]byte, epilogueSize)...)
+				linker.code = append(linker.code, createArchNops(linker.Arch, epilogueSize)...)
+			case reloctype.R_GOTPCREL, reloctype.R_TLS_IE:
+				objsym.Reloc[i].EpilogueOffset = len(linker.code) - symbol.Offset
+				objsym.Reloc[i].EpilogueSize = maxExtraInstructionBytesGOTPCREL
+				linker.code = append(linker.code, createArchNops(linker.Arch, objsym.Reloc[i].EpilogueSize)...)
+			case reloctype.R_ARM64_GOTPCREL, reloctype.R_ARM64_TLS_IE:
+				objsym.Reloc[i].EpilogueOffset = alignof(len(linker.code)-symbol.Offset, PtrSize)
+				objsym.Reloc[i].EpilogueSize = maxExtraInstructionBytesARM64GOTPCREL
+				// need to be able to pad to align to multiple of 8
+				alignment := alignof(len(linker.code)-symbol.Offset, PtrSize) - (len(linker.code) - symbol.Offset)
+				linker.code = append(linker.code, createArchNops(linker.Arch, objsym.Reloc[i].EpilogueSize+alignment)...)
 			case reloctype.R_CALL:
 				objsym.Reloc[i].EpilogueOffset = len(linker.code) - symbol.Offset
 				objsym.Reloc[i].EpilogueSize = maxExtraInstructionBytesCALL
-				linker.code = append(linker.code, make([]byte, maxExtraInstructionBytesCALL)...)
+				linker.code = append(linker.code, createArchNops(linker.Arch, maxExtraInstructionBytesCALL)...)
 			}
-			if linker.Arch.Family == sys.ARM64 {
-				bytearrayAlign(&linker.code, PtrSize)
-			}
+			bytearrayAlignNops(linker.Arch, &linker.code, PtrSize)
 		}
 
 		symbol.Func = &obj.Func{}
@@ -300,9 +373,7 @@ func (linker *Linker) addSymbol(name string) (symbol *obj.Sym, err error) {
 	case symkind.SDATA:
 		symbol.Offset = len(linker.data)
 		linker.data = append(linker.data, objsym.Data...)
-		if linker.Arch.Family == sys.ARM64 {
-			bytearrayAlign(&linker.data, PtrSize)
-		}
+		bytearrayAlign(&linker.data, PtrSize)
 	case symkind.SNOPTRDATA, symkind.SRODATA:
 		// because golang string assignment is pointer assignment, so store go.string constants
 		// in a separate segment and not unload when module unload.
@@ -314,32 +385,29 @@ func (linker *Linker) addSymbol(name string) (symbol *obj.Sym, err error) {
 		} else {
 			symbol.Offset = len(linker.noptrdata)
 			linker.noptrdata = append(linker.noptrdata, objsym.Data...)
-			if linker.Arch.Family == sys.ARM64 {
-				bytearrayAlign(&linker.noptrdata, PtrSize)
-			}
+			bytearrayAlign(&linker.noptrdata, PtrSize)
 		}
 	case symkind.SBSS:
 		symbol.Offset = len(linker.bss)
 		linker.bss = append(linker.bss, objsym.Data...)
-		if linker.Arch.Family == sys.ARM64 {
-			bytearrayAlign(&linker.bss, PtrSize)
-		}
+		bytearrayAlign(&linker.bss, PtrSize)
 	case symkind.SNOPTRBSS:
 		symbol.Offset = len(linker.noptrbss)
 		linker.noptrbss = append(linker.noptrbss, objsym.Data...)
-		if linker.Arch.Family == sys.ARM64 {
-			bytearrayAlign(&linker.noptrbss, PtrSize)
-		}
+		bytearrayAlign(&linker.noptrbss, PtrSize)
+	case symkind.STLSBSS:
+		// Nothing to do, since runtime.tls_g should be resolved from the host binary
 	default:
 		return nil, fmt.Errorf("invalid symbol:%s kind:%d", symbol.Name, symbol.Kind)
 	}
 
+	symbol.Size = len(linker.code) - symbol.Offset
 	for _, loc := range objsym.Reloc {
 		reloc := loc
 		reloc.Offset = reloc.Offset + symbol.Offset
 		reloc.EpilogueOffset = reloc.EpilogueOffset + symbol.Offset
 		if _, ok := linker.objsymbolMap[reloc.Sym.Name]; ok {
-			reloc.Sym, err = linker.addSymbol(reloc.Sym.Name)
+			reloc.Sym, err = linker.addSymbol(reloc.Sym.Name, globalSymPtr)
 			if err != nil {
 				return nil, err
 			}
@@ -353,7 +421,7 @@ func (linker *Linker) addSymbol(name string) (symbol *obj.Sym, err error) {
 				}
 			}
 		} else {
-			if reloc.Type == reloctype.R_TLS_LE {
+			if reloc.Type == reloctype.R_TLS_LE || reloc.Type == reloctype.R_TLS_IE {
 				reloc.Sym.Name = TLSNAME
 				reloc.Sym.Offset = loc.Offset
 			}
@@ -375,9 +443,7 @@ func (linker *Linker) addSymbol(name string) (symbol *obj.Sym, err error) {
 					linker.noptrdata = append(linker.noptrdata, nameLen...)
 					linker.noptrdata = append(linker.noptrdata, path...)
 					linker.noptrdata = append(linker.noptrdata, ZeroByte)
-					if linker.Arch.Family == sys.ARM64 {
-						bytearrayAlign(&linker.noptrdata, PtrSize)
-					}
+					bytearrayAlign(&linker.noptrdata, PtrSize)
 				}
 			}
 			if ispreprocesssymbol(reloc.Sym.Name) {
@@ -391,9 +457,7 @@ func (linker *Linker) addSymbol(name string) (symbol *obj.Sym, err error) {
 						reloc.Sym.Kind = symkind.SNOPTRDATA
 						reloc.Sym.Offset = len(linker.noptrdata)
 						linker.noptrdata = append(linker.noptrdata, bytes...)
-						if linker.Arch.Family == sys.ARM64 {
-							bytearrayAlign(&linker.noptrdata, PtrSize)
-						}
+						bytearrayAlign(&linker.noptrdata, PtrSize)
 					}
 				}
 			}
@@ -466,7 +530,7 @@ func (linker *Linker) readFuncData(symbol *obj.ObjSymbol, codeLen int) (err erro
 	for _, name := range symbol.Func.FuncData {
 		if _, ok := linker.symMap[name]; !ok {
 			if _, ok := linker.objsymbolMap[name]; ok {
-				if _, err = linker.addSymbol(name); err != nil {
+				if _, err = linker.addSymbol(name, nil); err != nil {
 					return err
 				}
 			} else if len(name) == 0 {
@@ -494,6 +558,9 @@ func (linker *Linker) addSymbolMap(symPtr map[string]uintptr, codeModule *CodeMo
 	symbolMap = make(map[string]uintptr)
 	segment := &codeModule.segment
 	for name, sym := range linker.symMap {
+		if !linker.isSymbolReachable(name) {
+			continue
+		}
 		if sym.Offset == InvalidOffset {
 			if ptr, ok := symPtr[sym.Name]; ok {
 				symbolMap[name] = ptr
@@ -509,12 +576,13 @@ func (linker *Linker) addSymbolMap(symPtr map[string]uintptr, codeModule *CodeMo
 			symbolMap[name] = uintptr(linker.symMap[name].Offset + segment.codeBase)
 			codeModule.Syms[sym.Name] = symbolMap[name]
 			if _, ok := symPtr[name]; ok {
-				// Mark the symbol as a duplicate
-				symbolMap[FirstModulePrefix+name] = symbolMap[name]
+				// Mark the symbol as a duplicate, and store the original entrypoint
+				symbolMap[FirstModulePrefix+name] = symPtr[name]
 			}
 		} else if strings.HasPrefix(sym.Name, ItabPrefix) {
 			if ptr, ok := symPtr[sym.Name]; ok {
 				symbolMap[name] = ptr
+				symbolMap[FirstModulePrefix+name] = ptr
 			}
 		} else {
 			if _, ok := symPtr[name]; !ok {
@@ -826,6 +894,9 @@ func (linker *Linker) deduplicateTypeDescriptors(codeModule *CodeModule, symbolM
 	byteorder := linker.Arch.ByteOrder
 	dedupedTypes := map[string]uintptr{}
 	for _, symbol := range linker.symMap {
+		if linker.options.DumpTextBeforeAndAfterRelocs && linker.options.RelocationDebugWriter != nil && symbol.Kind == symkind.STEXT && symbol.Offset >= 0 {
+			_, _ = fmt.Fprintf(linker.options.RelocationDebugWriter, "BEFORE DEDUPE (%x - %x) %142s: %x\n", codeModule.codeBase+symbol.Offset, codeModule.codeBase+symbol.Offset+symbol.Size, symbol.Name, codeModule.codeByte[symbol.Offset:symbol.Offset+symbol.Size])
+		}
 	relocLoop:
 		for _, loc := range symbol.Reloc {
 			addr := symbolMap[loc.Sym.Name]
@@ -857,7 +928,7 @@ func (linker *Linker) deduplicateTypeDescriptors(codeModule *CodeModule, symbolM
 					_, isVariant := symbolIsVariant(loc.Sym.Name)
 					if uintptr(unsafe.Pointer(t)) != symbolMap[FirstModulePrefix+loc.Sym.Name] && !isVariant {
 						// This shouldn't be possible and indicates a registration bug
-						panic(fmt.Sprintf("found another firstmodule type that wasn't registered by goloader: %s", loc.Sym.Name))
+						panic(fmt.Sprintf("found another firstmodule type that wasn't registered by goloader. Symbol name: %s, type name: %s. This shouldn't be possible and indicates a bug in firstmodule type registration\n", loc.Sym.Name, t.nameOff(t.str).name()))
 					}
 					// Store this for later so we know which types were deduplicated
 					dedupedTypes[loc.Sym.Name] = uintptr(unsafe.Pointer(t))
@@ -875,7 +946,7 @@ func (linker *Linker) deduplicateTypeDescriptors(codeModule *CodeModule, symbolM
 					}
 
 					addr = uintptr(unsafe.Pointer(t))
-					if linker.options.RelocationDebugWriter != nil {
+					if linker.options.RelocationDebugWriter != nil && loc.Offset != InvalidOffset {
 						var weakness string
 						if loc.Type&reloctype.R_WEAK > 0 {
 							weakness = "WEAK|"
@@ -886,17 +957,16 @@ func (linker *Linker) deduplicateTypeDescriptors(codeModule *CodeModule, symbolM
 							addr, int(addr)-addrBase, symbol.Name, sym.Name)
 					}
 					switch loc.Type {
+					case reloctype.R_GOTPCREL:
+						linker.relocateGOTPCREL(addr, loc, relocByte)
 					case reloctype.R_PCREL:
-						// The replaced t from another module will probably yield a massive negative offset, but that's ok as
-						// PC-relative addressing is allowed to be negative (even if not very cache friendly)
-						offset := int(addr) - (addrBase + loc.Offset + loc.Size) + loc.Add
-						if offset > 0x7FFFFFFF || offset < -0x80000000 {
-							err = fmt.Errorf("symName: %s offset: %d overflows!\n", sym.Name, offset)
+						err2 := linker.relocatePCREL(addr, loc, &codeModule.segment, relocByte, addrBase)
+						if err2 != nil {
+							err = err2
 						}
-						byteorder.PutUint32(relocByte[loc.Offset:], uint32(offset))
 					case reloctype.R_CALLARM, reloctype.R_CALLARM64, reloctype.R_CALL:
 						panic("This should not be possible")
-					case reloctype.R_ADDRARM64, reloctype.R_ARM64_PCREL_LDST8, reloctype.R_ARM64_PCREL_LDST16, reloctype.R_ARM64_PCREL_LDST32, reloctype.R_ARM64_PCREL_LDST64:
+					case reloctype.R_ADDRARM64, reloctype.R_ARM64_PCREL_LDST8, reloctype.R_ARM64_PCREL_LDST16, reloctype.R_ARM64_PCREL_LDST32, reloctype.R_ARM64_PCREL_LDST64, reloctype.R_ARM64_GOTPCREL:
 						err2 := linker.relocateADRP(relocByte[loc.Offset:], loc, segment, addr)
 						if err2 != nil {
 							err = err2
@@ -929,6 +999,9 @@ func (linker *Linker) deduplicateTypeDescriptors(codeModule *CodeModule, symbolM
 				}
 			}
 		}
+		if linker.options.DumpTextBeforeAndAfterRelocs && linker.options.RelocationDebugWriter != nil && symbol.Kind == symkind.STEXT && symbol.Offset >= 0 {
+			_, _ = fmt.Fprintf(linker.options.RelocationDebugWriter, " AFTER DEDUPE (%x - %x) %142s: %x\n", codeModule.codeBase+symbol.Offset, codeModule.codeBase+symbol.Offset+symbol.Size, symbol.Name, codeModule.codeByte[symbol.Offset:symbol.Offset+symbol.Size])
+		}
 	}
 	codeModule.patchedTypeMethodsIfn = patchedTypeMethodsIfn
 	codeModule.patchedTypeMethodsTfn = patchedTypeMethodsTfn
@@ -942,17 +1015,40 @@ func (linker *Linker) deduplicateTypeDescriptors(codeModule *CodeModule, symbolM
 	return err
 }
 
-func (linker *Linker) buildExports(codeModule *CodeModule, symbolMap map[string]uintptr, globalSymPtr map[string]uintptr) {
+func (linker *Linker) buildExports(codeModule *CodeModule, symbolMap map[string]uintptr) {
 	codeModule.SymbolsByPkg = map[string]map[string]interface{}{}
 	for _, pkg := range linker.pkgs {
 		pkgSyms := map[string]interface{}{}
 		for name, info := range pkg.Exports {
+			reachable := linker.isSymbolReachable(info.SymName)
 			typeAddr, ok := symbolMap[info.TypeName]
 			if !ok {
-				panic("could not find type symbol " + info.TypeName)
+				if !reachable {
+					// Doesn't matter
+					continue
+				}
+				// Only panic if a type is missing from the main JIT package - types might not be included for //go:linkname'd symbols, and that's ok
+				if linker.pkgs[len(linker.pkgs)-1] == pkg {
+					panic("could not find type symbol " + info.TypeName + " needed for " + info.SymName)
+				} else {
+					continue
+				}
+			}
+			fmTypeAddr, ok := symbolMap[FirstModulePrefix+info.TypeName]
+			if ok && fmTypeAddr != typeAddr {
+				// Prefer firstmodule types if equal (i.e. deduplicate)
+				seen := map[_typePair]struct{}{}
+				fmTyp := (*_type)(unsafe.Pointer(fmTypeAddr))
+				newTyp := (*_type)(unsafe.Pointer(typeAddr))
+				if fmTyp.hash == newTyp.hash && typesEqual(fmTyp, newTyp, seen) {
+					typeAddr = fmTypeAddr
+				}
 			}
 			addr, ok := symbolMap[info.SymName]
 			if !ok {
+				if !reachable {
+					continue
+				}
 				panic(fmt.Sprintf("could not find symbol %s in package %s", info.SymName, pkg.PkgPath))
 			}
 			t := (*_type)(unsafe.Pointer(typeAddr))
@@ -994,11 +1090,21 @@ func (linker *Linker) UnresolvedExternalSymbols(symbolMap map[string]uintptr, ig
 				// They can be checked for structural equality if the JIT code builds it, but not if we blindly use the firstmodule version of a _type
 				if typeSym, ok := symbolMap[symName]; ok {
 					t := (*_type)(unsafe.Pointer(typeSym))
+					firstModuleTypeHasUnreachableMethods := false
+					if u := t.uncommon(); u != nil && linker.isTypeReachable(symName) {
+						for _, method := range u.methods() {
+							if method.tfn == -1 || method.ifn == -1 {
+								// If any methods are unreachable, we should treat this type as unresolved, since we don't know what might call these methods, so we should force a rebuild
+								firstModuleTypeHasUnreachableMethods = true
+								break
+							}
+						}
+					}
 					_, isStdLibPkg := stdLibPkgs[t.PkgPath()]
 					// Don't rebuild types in the stdlib, as these shouldn't be different (assuming same toolchain version for host and JIT)
-					if t.PkgPath() != "" && !isStdLibPkg {
+					if t.PkgPath() != "" && (!isStdLibPkg || firstModuleTypeHasUnreachableMethods) {
 						// Only rebuild types which are reachable (via relocs) from the main package, otherwise we'll end up building everything unnecessarily
-						if _, ok := linker.reachableTypes[symName]; ok && !unsafeBlindlyUseFirstModuleTypes {
+						if (linker.isTypeReachable(symName) && !unsafeBlindlyUseFirstModuleTypes) || firstModuleTypeHasUnreachableMethods {
 							symMap[symName] = sym
 						}
 					}
@@ -1006,9 +1112,19 @@ func (linker *Linker) UnresolvedExternalSymbols(symbolMap map[string]uintptr, ig
 			}
 			if _, ok := symbolMap[symName]; !ok || shouldSkipDedup {
 				if _, ok := linker.objsymbolMap[symName]; !ok || shouldSkipDedup {
-					symMap[symName] = sym
+					if linker.isSymbolReachable(symName) {
+						symMap[symName] = sym
+					}
 				}
 			}
+		}
+	}
+
+	for _, sym := range symMap {
+		_, alreadyBuiltPkg := linker.pkgsByName[sym.Pkg]
+		if alreadyBuiltPkg {
+			// If we already built and loaded the package which this symbol came from, it's probably linknamed and implemented in runtime
+			sym.Pkg = "runtime"
 		}
 	}
 	return symMap
@@ -1016,10 +1132,20 @@ func (linker *Linker) UnresolvedExternalSymbols(symbolMap map[string]uintptr, ig
 
 func (linker *Linker) UnresolvedPackageReferences(existingPkgs []string) []string {
 	var pkgList []string
+outer:
 	for pkgName := range linker.pkgNamesWithUnresolved {
 		for _, existing := range existingPkgs {
 			if pkgName == existing {
-				continue
+				continue outer
+			}
+		}
+		pkgList = append(pkgList, pkgName)
+	}
+outer2:
+	for pkgName := range linker.pkgNamesToForceRebuild {
+		for _, alreadyAdded := range pkgList {
+			if alreadyAdded == pkgName {
+				continue outer2
 			}
 		}
 		pkgList = append(pkgList, pkgName)
@@ -1033,20 +1159,22 @@ func (linker *Linker) UnresolvedExternalSymbolUsers(symbolMap map[string]uintptr
 		if sym.Offset == InvalidOffset {
 			if _, ok := symbolMap[symName]; !ok {
 				if _, ok := linker.objsymbolMap[symName]; !ok {
-					var requiredBySet = map[string]struct{}{}
-					for _, otherSym := range linker.symMap {
-						for _, reloc := range otherSym.Reloc {
-							if reloc.Sym.Name == symName {
-								requiredBySet[otherSym.Name] = struct{}{}
+					if linker.isSymbolReachable(symName) {
+						var requiredBySet = map[string]struct{}{}
+						for _, otherSym := range linker.symMap {
+							for _, reloc := range otherSym.Reloc {
+								if reloc.Sym.Name == symName {
+									requiredBySet[otherSym.Name] = struct{}{}
+								}
 							}
 						}
+						requiredByList := make([]string, 0, len(requiredBySet))
+						for k := range requiredBySet {
+							requiredByList = append(requiredByList, k)
+						}
+						sort.Strings(requiredByList)
+						requiredBy[sym.Name] = requiredByList
 					}
-					requiredByList := make([]string, 0, len(requiredBySet))
-					for k := range requiredBySet {
-						requiredByList = append(requiredByList, k)
-					}
-					sort.Strings(requiredByList)
-					requiredBy[sym.Name] = requiredByList
 				}
 			}
 		}
@@ -1101,7 +1229,7 @@ func Load(linker *Linker, symPtr map[string]uintptr) (codeModule *CodeModule, er
 		if err = linker.relocate(codeModule, symbolMap); err == nil {
 			if err = linker.buildModule(codeModule, symbolMap); err == nil {
 				if err = linker.deduplicateTypeDescriptors(codeModule, symbolMap); err == nil {
-					linker.buildExports(codeModule, symbolMap, symPtr)
+					linker.buildExports(codeModule, symbolMap)
 					MakeThreadJITCodeExecutable(uintptr(codeModule.codeBase), codeModule.maxCodeLength)
 					if err = linker.doInitialize(codeModule, symbolMap); err == nil {
 						return codeModule, err

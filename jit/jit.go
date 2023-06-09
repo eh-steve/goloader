@@ -9,6 +9,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/eh-steve/goloader"
+	"github.com/eh-steve/goloader/libc"
 	"github.com/eh-steve/goloader/obj"
 	"io"
 	"log"
@@ -33,19 +34,6 @@ func init() {
 	if err != nil {
 		log.Printf("jit package failed to register symbols of current binary: %s\n", err)
 	}
-	check()
-}
-
-// Forbidden packages should never be rebuilt as dependencies, a lot of the runtime
-// assembly code expects there to be only 1 instance of certain runtime symbols
-var forbiddenSystemPkgs = map[string]struct{}{
-	"runtime":                 {}, // Not a good idea
-	"runtime/internal/atomic": {}, // Not a good idea
-	"runtime/internal":        {}, // Not a good idea
-	"runtime/cpu":             {}, // Not a good idea
-	"internal/cpu":            {}, // Not a good idea
-	"reflect":                 {}, // Not a good idea
-	"unsafe":                  {}, // Not a real package
 }
 
 func GlobalSymPtr() map[string]uintptr {
@@ -87,8 +75,16 @@ func RegisterTypes(types ...interface{}) {
 }
 
 func RegisterCGoSymbol(symNameC string, symNameGo string) bool {
-	addr, err := LookupDynamicSymbol(symNameC)
+	if runtime.GOOS == "darwin" {
+		// For some reason, error doesn't follow the usual pattern of just stripping "libc_"
+		// See runtime/sys_darwin.go
+		if symNameC == "error" {
+			symNameC = "__error"
+		}
+	}
+	addr, err := libc.LookupDynamicSymbol(symNameC)
 	if err != nil {
+		log.Println(err)
 		return false
 	} else {
 		globalMutex.Lock()
@@ -108,13 +104,19 @@ type BuildConfig struct {
 	SymbolNameOrder                  []string // Control the layout of symbols in the linker's linear memory - useful for reproducing bugs
 	RandomSymbolNameOrder            bool     // Randomise the order of linker symbols (may identify linker bugs)
 	RelocationDebugWriter            io.Writer
+	DumpTextBeforeAfterRelocation    bool
 	SkipTypeDeduplicationForPackages []string
 	UnsafeBlindlyUseFirstmoduleTypes bool
+	Dynlink                          bool
 }
 
-func mergeBuildFlags(extraBuildFlags []string) []string {
-	// This flag requires the Go toolchain to have been patched via PatchGC()
+func mergeBuildFlags(extraBuildFlags []string, dynlink bool) []string {
+	// This -exporttypes flag requires the Go toolchain to have been patched via PatchGC()
 	var gcFlags = []string{"-exporttypes"}
+	if dynlink {
+		// Also add -dynlink to force R_PCREL relocs to use R_GOTPCREL to allow offsets larger than 32-bits for inter-package relocs
+		gcFlags = append(gcFlags, "-dynlink")
+	}
 	var buildFlags []string
 	for _, bf := range extraBuildFlags {
 		// Merge together user supplied -gcflags into a single flag
@@ -137,7 +139,7 @@ func mergeBuildFlags(extraBuildFlags []string) []string {
 
 func execBuild(config BuildConfig, workDir, outputFilePath string, targets []string) error {
 	var args = []string{"build"}
-	args = append(args, mergeBuildFlags(config.ExtraBuildFlags)...)
+	args = append(args, mergeBuildFlags(config.ExtraBuildFlags, config.Dynlink)...)
 
 	args = append(args, "-o", outputFilePath)
 	args = append(args, targets...)
@@ -172,7 +174,7 @@ func execBuild(config BuildConfig, workDir, outputFilePath string, targets []str
 
 func resolveDependencies(config BuildConfig, workDir, buildDir string, outputFilePath, packageName string, pkg *Package, linkerOpts []goloader.LinkerOptFunc, stdLibPkgs map[string]struct{}) (*goloader.Linker, error) {
 	// Now check whether all imported packages are available in the main binary, otherwise we need to build and load them too
-	linker, err := goloader.ReadObjs([]string{outputFilePath}, []string{packageName}, linkerOpts...)
+	linker, err := goloader.ReadObjs([]string{outputFilePath}, []string{packageName}, globalSymPtr, linkerOpts...)
 
 	if err != nil {
 		return nil, fmt.Errorf("could not read symbols from object file '%s': %w", outputFilePath, err)
@@ -207,7 +209,7 @@ func resolveDependencies(config BuildConfig, workDir, buildDir string, outputFil
 			return nil, errDeps
 		}
 
-		depsLinker, err := goloader.ReadObjs(append(depBinaries, outputFilePath), append(depImportPaths, packageName), linkerOpts...)
+		depsLinker, err := goloader.ReadObjs(depBinaries, depImportPaths, globalSymPtr, linkerOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("could not read symbols from dependency object files '%s': %w", depImportPaths, err)
 		}
@@ -257,17 +259,15 @@ func getMissingDeps(sortedDeps []string, unresolvedSymbols, unresolvedSymbolsWit
 			// Unescape dots in the symName path since the compiler would have escaped them in cmd/internal/objabi.PathToPrefix()
 			symName := unescapeSymName(symNameEscaped)
 			if unresolvedSymbols[symNameEscaped].Pkg == objabi.PathToPrefix(dep) {
-				if _, forbidden := forbiddenSystemPkgs[dep]; !forbidden {
-					if _, haveSeen := seen[dep]; !haveSeen {
-						if _, ok := globalPkgSet[dep]; ok && debug {
-							if _, ok := unresolvedSymbolsWithoutSkip[symNameEscaped]; !ok {
-								log.Printf("main binary contains package '%s', but symbol deduplication was skipped so forcing rebuild %s\n", dep, symName)
-							} else {
-								log.Printf("main binary contains partial package '%s', but not symbol %s\n", dep, symName)
-							}
+				if _, haveSeen := seen[dep]; !haveSeen {
+					if _, ok := globalPkgSet[dep]; ok && debug {
+						if _, ok := unresolvedSymbolsWithoutSkip[symNameEscaped]; !ok {
+							log.Printf("main binary contains package '%s', but symbol deduplication was skipped so forcing rebuild %s\n", dep, symName)
+						} else {
+							log.Printf("main binary contains partial package '%s', but not symbol %s\n", dep, symName)
 						}
-						missingDeps[dep] = struct{}{}
 					}
+					missingDeps[dep] = struct{}{}
 				}
 			}
 		}
@@ -278,7 +278,7 @@ func getMissingDeps(sortedDeps []string, unresolvedSymbols, unresolvedSymbolsWit
 func addCGoSymbols(externalUnresolvedSymbols map[string]*obj.Sym) {
 	if runtime.GOOS == "darwin" {
 		for k := range externalUnresolvedSymbols {
-			if strings.IndexByte(k, '.') == -1 {
+			if strings.IndexByte(k, '.') == -1 && !strings.HasPrefix(k, goloader.TypePrefix) {
 				if strings.HasPrefix(k, "libc_") {
 					// For dynlib symbols in $GOROOT/src/syscall/syscall_darwin.go
 					RegisterCGoSymbol(strings.TrimPrefix(k, "libc_"), k)
@@ -289,18 +289,22 @@ func addCGoSymbols(externalUnresolvedSymbols map[string]*obj.Sym) {
 					// For dynlib symbols in $GOROOT/src/crypto/x509/internal/macos/corefoundation.go
 					RegisterCGoSymbol(strings.TrimPrefix(k, "x509_"), k)
 				} else {
-					RegisterCGoSymbol(k, k)
 					if k[0] == '_' {
 						RegisterCGoSymbol(k[1:], k)
+					} else {
+						RegisterCGoSymbol(k, k)
 					}
 				}
 			}
 			// TODO - if more symbols use the //go:cgo_import_dynamic linker pragma, then they would also need to be registered here
 		}
+	} else if runtime.GOOS == "windows" {
+		// Windows doesn't have a libdl f
+		return
 	} else {
 		for k := range externalUnresolvedSymbols {
 			// CGo symbols don't have a package name
-			if strings.IndexByte(k, '.') == -1 {
+			if strings.IndexByte(k, '.') == -1 && !strings.HasPrefix(k, goloader.TypePrefix) {
 				RegisterCGoSymbol(k, k)
 			}
 		}
@@ -336,6 +340,7 @@ func buildAndLoadDeps(config BuildConfig,
 	}
 	sort.Strings(missingDepsSorted)
 
+	concurrencyLimit := make(chan struct{}, runtime.GOMAXPROCS(0))
 	for _, missingDep := range missingDepsSorted {
 		if _, ok := seen[missingDep]; ok {
 			continue
@@ -345,6 +350,7 @@ func buildAndLoadDeps(config BuildConfig,
 
 		filename := filepath.Join(buildDir, hex.EncodeToString(h.Sum(nil))+"___pkg___.a")
 
+		concurrencyLimit <- struct{}{}
 		go func(filename, missingDep string) {
 			if config.DebugLog {
 				log.Printf("Building dependency '%s' (%s)\n", missingDep, filename)
@@ -354,7 +360,7 @@ func buildAndLoadDeps(config BuildConfig,
 			}
 
 			args := []string{"build"}
-			args = append(args, mergeBuildFlags(config.ExtraBuildFlags)...)
+			args = append(args, mergeBuildFlags(config.ExtraBuildFlags, config.Dynlink)...)
 			args = append(args, "-o", filename, missingDep)
 			command := exec.Command(config.GoBinary, args...)
 			if config.DebugLog {
@@ -379,6 +385,7 @@ func buildAndLoadDeps(config BuildConfig,
 				errsMutex.Unlock()
 			}
 			wg.Done()
+			<-concurrencyLimit
 		}(filename, missingDep)
 		existingImport := false
 		for _, existing := range *builtPackageImportPaths {
@@ -387,8 +394,9 @@ func buildAndLoadDeps(config BuildConfig,
 			}
 		}
 		if !existingImport {
-			*builtPackageImportPaths = append(*builtPackageImportPaths, missingDep)
-			*buildPackageFilePaths = append(*buildPackageFilePaths, filename)
+			// Prepend, so that deps get loaded first
+			*builtPackageImportPaths = append([]string{missingDep}, *builtPackageImportPaths...)
+			*buildPackageFilePaths = append([]string{filename}, *buildPackageFilePaths...)
 		}
 	}
 	wg.Wait()
@@ -400,15 +408,17 @@ func buildAndLoadDeps(config BuildConfig,
 		return fmt.Errorf("got %d during build of dependencies: %w%s", len(errs), errs[0], extra)
 	}
 
-	linker, err := goloader.ReadObjs(*buildPackageFilePaths, *builtPackageImportPaths, linkerOpts...)
+	linker, err := goloader.ReadObjs(*buildPackageFilePaths, *builtPackageImportPaths, globalSymPtr, linkerOpts...)
 	if err != nil {
 		return fmt.Errorf("linker failed to read symbols from dependency object files (%s): %w", *builtPackageImportPaths, err)
 	}
 
 	globalMutex.Lock()
 	nextUnresolvedSymbols := linker.UnresolvedExternalSymbols(globalSymPtr, nil, stdLibPkgs, config.UnsafeBlindlyUseFirstmoduleTypes)
+	nextUnresolvedPackages := linker.UnresolvedPackageReferences(sortedDeps)
 	globalMutex.Unlock()
 
+	sortedDeps = append(sortedDeps, nextUnresolvedPackages...)
 	addCGoSymbols(nextUnresolvedSymbols)
 	linker.UnloadStrings()
 
@@ -429,7 +439,11 @@ func buildAndLoadDeps(config BuildConfig,
 				missingList = append(missingList, k)
 			}
 			sort.Strings(missingList)
-			log.Printf("Still have %d unresolved symbols after building dependencies. Recursing further to build: [\n  %s\n]\n", len(nextUnresolvedSymbols), strings.Join(missingList, ",\n  "))
+			missingSyms := make([]string, 0, len(nextUnresolvedSymbols))
+			for symName, objSym := range nextUnresolvedSymbols {
+				missingSyms = append(missingSyms, symName+" (package: '"+objSym.Pkg+"')")
+			}
+			log.Printf("Still have %d unresolved symbols \n[\n  %s\n]\n after building dependencies. Recursing further to build: \n[\n  %s\n]\n", len(nextUnresolvedSymbols), strings.Join(missingSyms, ",\n  "), strings.Join(missingList, ",\n  "))
 		}
 		return buildAndLoadDeps(config, workDir, buildDir, newSortedDeps, nextUnresolvedSymbols, nextUnresolvedSymbols, seen, builtPackageImportPaths, buildPackageFilePaths, depth+1, linkerOpts, stdLibPkgs)
 	}
@@ -446,6 +460,9 @@ func (config *BuildConfig) linkerOpts() []goloader.LinkerOptFunc {
 	}
 	if config.RelocationDebugWriter != nil {
 		linkerOpts = append(linkerOpts, goloader.WithRelocationDebugWriter(config.RelocationDebugWriter))
+	}
+	if config.DumpTextBeforeAfterRelocation {
+		linkerOpts = append(linkerOpts, goloader.WithDumpTextBeforeAndAfterRelocs())
 	}
 	if len(config.SkipTypeDeduplicationForPackages) > 0 {
 		linkerOpts = append(linkerOpts, goloader.WithSkipTypeDeduplicationForPackages(config.SkipTypeDeduplicationForPackages))

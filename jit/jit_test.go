@@ -2,7 +2,6 @@ package jit_test
 
 import (
 	"bytes"
-	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"github.com/eh-steve/goloader"
@@ -12,16 +11,20 @@ import (
 	"github.com/eh-steve/goloader/jit/testdata/test_type_mismatch"
 	"github.com/eh-steve/goloader/jit/testdata/test_type_mismatch/typedef"
 	"github.com/eh-steve/goloader/unload/jsonunload"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	_ "net/http/pprof"
 	"os"
+	"path/filepath"
 	"reflect"
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -29,17 +32,25 @@ import (
 	"unsafe"
 )
 
-// Can edit these flags to check all tests still work with different linker options
-var randomSymbolOrder = false
-var buildEnv = []string{}
-
-// var goBinary = "/mnt/rpool/go_versions/go1.18.8.linux-amd64/go/bin/go"
-
-var goBinary = ""
-
 type testData struct {
 	files []string
 	pkg   string
+}
+
+// Can edit these flags to check all tests still work with different linker options
+var baseConfig = jit.BuildConfig{
+	GoBinary:                         "",
+	KeepTempFiles:                    false,
+	ExtraBuildFlags:                  nil,
+	BuildEnv:                         os.Environ(),
+	TmpDir:                           "",
+	DebugLog:                         false,
+	SymbolNameOrder:                  nil,
+	RandomSymbolNameOrder:            false,
+	RelocationDebugWriter:            nil,
+	SkipTypeDeduplicationForPackages: nil,
+	UnsafeBlindlyUseFirstmoduleTypes: false,
+	Dynlink:                          os.Getenv("JIT_GC_DYNLINK") == "1",
 }
 
 func buildLoadable(t *testing.T, conf jit.BuildConfig, testName string, data testData) (module *goloader.CodeModule, symbols map[string]interface{}) {
@@ -59,7 +70,27 @@ func buildLoadable(t *testing.T, conf jit.BuildConfig, testName string, data tes
 		if err != nil {
 			t.Fatal(err)
 		}
+		// cd into testdata dir to avoid polluting the jit package's go.mod, and cd back once finished
+		pwd, err := os.Getwd()
+		absFile, err := filepath.Abs(data.files[0])
+		if err != nil {
+			panic(err)
+		}
+		testdataDir := filepath.Dir(filepath.Dir(absFile))
+		err = os.Chdir(testdataDir)
+		if err != nil {
+			panic(err)
+		}
+		defer func() {
+			err = os.Chdir(pwd)
+			if err != nil {
+				panic(err)
+			}
+		}()
 		loadable, err = jit.BuildGoText(conf, string(goText))
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -83,16 +114,17 @@ func buildLoadable(t *testing.T, conf jit.BuildConfig, testName string, data tes
 	return
 }
 
-func TestJitSimpleFunctions(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
+func goVersion(t *testing.T) int64 {
+	GoVersionParts := strings.Split(strings.TrimPrefix(runtime.Version(), "go"), ".")
+	version, err := strconv.ParseInt(GoVersionParts[1], 10, 64)
+	if err != nil {
+		t.Fatalf("failed to parse go version: %s", err)
 	}
+	return version
+}
+
+func TestJitSimpleFunctions(t *testing.T) {
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_simple_func/test.go"},
@@ -127,15 +159,7 @@ func TestJitSimpleFunctions(t *testing.T) {
 }
 
 func TestHeapStrings(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_simple_func/test.go"},
@@ -162,16 +186,7 @@ func TestHeapStrings(t *testing.T) {
 }
 
 func TestJitJsonUnmarshal(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
-
+	conf := baseConfig
 	data := testData{
 		files: []string{"./testdata/test_json_unmarshal/test.go"},
 		pkg:   "./testdata/test_json_unmarshal",
@@ -202,16 +217,7 @@ func TestJitJsonUnmarshal(t *testing.T) {
 }
 
 func TestJitComplexFunctions(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
-
+	conf := baseConfig
 	data := testData{
 		files: []string{"./testdata/test_complex_func/test.go"},
 		pkg:   "testdata/test_complex_func",
@@ -275,16 +281,7 @@ func TestJitComplexFunctions(t *testing.T) {
 }
 
 func TestJitEmbeddedStruct(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
-
+	conf := baseConfig
 	data := testData{
 		files: []string{"./testdata/test_embedded/test.go"},
 		pkg:   "testdata/test_embedded",
@@ -316,15 +313,10 @@ func TestJitCGoCall(t *testing.T) {
 	if os.Getenv("CGO_ENABLED") == "0" {
 		t.Skip("CGo disabled")
 	}
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
+	if runtime.GOOS == "windows" && goVersion(t) < 19 {
+		t.Skip("PE relocs not yet supported on go 1.18")
 	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_cgo/test.go"},
@@ -362,33 +354,13 @@ func TestJitCGoCall(t *testing.T) {
 }
 
 func TestJitHttpGet(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_http_get/test.go"},
 		pkg:   "testdata/test_http_get",
 	}
 	testNames := []string{"BuildGoFiles", "BuildGoPackage", "BuildGoText"}
-
-	// Certain crypto and http library code has asynchronous execution of various functions
-	// (for caching things after first computation using sync.Once etc.) e.g.:
-	// vendor/golang.org/x/net/http/httpproxy.(*config).proxyForURL
-	// crypto/x509.initSystemRoots
-	// To avoid these functions running against unloaded memory after each test is finished, we build them into the test binary
-	// (but don't build all of net/http in, so it's still a useful test)
-
-	r, _ := http.NewRequest("", "", nil)
-	_, _ = http.ProxyFromEnvironment(r)
-	_, _ = x509.SystemCertPool()
-	x509.NewCertPool().AppendCertsFromPEM(nil)
 
 	for _, testName := range testNames {
 		t.Run(testName, func(t *testing.T) {
@@ -406,7 +378,7 @@ func TestJitHttpGet(t *testing.T) {
 				afterCall = runtime.NumGoroutine()
 				fmt.Printf("Waiting for last goroutine to stop before unloading, started with %d, now have %d\n", start, afterCall)
 			}
-			fmt.Println(result)
+			fmt.Println(len(result))
 			err = module.Unload()
 			if err != nil {
 				t.Fatal(err)
@@ -419,33 +391,13 @@ func TestJitHttpGet(t *testing.T) {
 }
 
 func TestPatchMultipleModuleItabs(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_http_get/test.go"},
 		pkg:   "testdata/test_http_get",
 	}
 	testNames := []string{"BuildGoFiles", "BuildGoPackage", "BuildGoText"}
-
-	// Certain crypto and http library code has asynchronous execution of various functions
-	// (for caching things after first computation using sync.Once etc.) e.g.:
-	// vendor/golang.org/x/net/http/httpproxy.(*config).proxyForURL
-	// crypto/x509.initSystemRoots
-	// To avoid these functions running against unloaded memory after each test is finished, we build them into the test binary
-	// (but don't build all of net/http in, so it's still a useful test)
-
-	r, _ := http.NewRequest("", "", nil)
-	_, _ = http.ProxyFromEnvironment(r)
-	_, _ = x509.SystemCertPool()
-	x509.NewCertPool().AppendCertsFromPEM(nil)
 
 	for _, testName := range testNames {
 		t.Run(testName, func(t *testing.T) {
@@ -466,7 +418,7 @@ func TestPatchMultipleModuleItabs(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			fmt.Println(result2)
+			fmt.Println(len(result2))
 			afterCall := runtime.NumGoroutine()
 			for afterCall != start {
 				time.Sleep(100 * time.Millisecond)
@@ -474,7 +426,7 @@ func TestPatchMultipleModuleItabs(t *testing.T) {
 				afterCall = runtime.NumGoroutine()
 				fmt.Printf("Waiting for last goroutine to stop before unloading, started with %d, now have %d\n", start, afterCall)
 			}
-			fmt.Println(result1)
+			fmt.Println(len(result1))
 			err = module1.Unload()
 			if err != nil {
 				t.Fatal(err)
@@ -482,7 +434,7 @@ func TestPatchMultipleModuleItabs(t *testing.T) {
 			time.Sleep(300 * time.Millisecond)
 
 			result2, err = httpGet2("https://ipinfo.io/ip")
-			fmt.Println(result2)
+			fmt.Println(len(result2))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -496,15 +448,7 @@ func TestPatchMultipleModuleItabs(t *testing.T) {
 
 // TODO - something wrong with this
 func TestJitPanicRecoveryStackTrace(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_stack_trace/file1.go",
@@ -582,15 +526,7 @@ func checkStackTrace(t *testing.T, thing common.SomeInterface) (err error) {
 }
 
 func TestJitGoroutines(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_goroutines/test.go"},
@@ -645,15 +581,7 @@ func TestJitGoroutines(t *testing.T) {
 }
 
 func TestLoadUnloadMultipleModules(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+	conf := baseConfig
 
 	data1 := testData{
 		files: []string{"./testdata/test_simple_func/test.go"},
@@ -729,20 +657,12 @@ func TestLoadUnloadMultipleModules(t *testing.T) {
 	}
 }
 
-func TestStackSplit(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+func TestStackMove(t *testing.T) {
+	conf := baseConfig
 
 	data := testData{
-		files: []string{"./testdata/test_stack_split/test.go"},
-		pkg:   "testdata/test_stack_split",
+		files: []string{"./testdata/test_stack_move/test.go"},
+		pkg:   "testdata/test_stack_move",
 	}
 	testNames := []string{"BuildGoFiles", "BuildGoPackage", "BuildGoText"}
 
@@ -754,12 +674,13 @@ func TestStackSplit(t *testing.T) {
 			var someVarOnStack int
 			addr := uintptr(unsafe.Pointer(&someVarOnStack))
 
-			splitCount := RecurseUntilMaxDepth(0, addr, 144, 0)
+			stackMoveCount := RecurseUntilMaxDepth(0, addr, 144, 0)
 
-			if splitCount < 12 {
-				t.Errorf("expected at least 12 stack splits")
+			if stackMoveCount < 8 {
+				// Depends on what beefy goroutine stacks are available to reuse when the test starts - if it gets a big one, there'll be fewer stack moves
+				t.Errorf("expected at least 8 stack moves")
 			}
-			fmt.Println("Split count:", splitCount)
+			fmt.Println("Stack move count:", stackMoveCount)
 			err := module.Unload()
 			if err != nil {
 				t.Fatal(err)
@@ -772,15 +693,7 @@ func TestStackSplit(t *testing.T) {
 }
 
 func TestSimpleAsmFuncs(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+	conf := baseConfig
 
 	data := testData{
 		pkg: "testdata/test_simple_asm_func",
@@ -842,15 +755,7 @@ func TestComplexAsmFuncs(t *testing.T) {
 		}
 	}()
 
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "./",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_complex_asm_func/test.go"},
@@ -879,15 +784,7 @@ func TestComplexAsmFuncs(t *testing.T) {
 
 // https://github.com/pkujhd/goloader/issues/55
 func TestIssue55(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "./",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_issue55/t/t.go"},
@@ -902,6 +799,54 @@ func TestIssue55(t *testing.T) {
 
 			test := symbols["Test"].(func(intf p.Intf) p.Intf)
 			test(&p.Stru{})
+			err := module.Unload()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// https://github.com/pkujhd/goloader/issues/78
+func TestIssue78(t *testing.T) {
+	conf := baseConfig
+
+	data := testData{
+		files: []string{"./testdata/test_issue78/test.go"},
+		pkg:   "./testdata/test_issue78",
+	}
+
+	testNames := []string{"BuildGoFiles", "BuildGoPackage", "BuildGoText"}
+
+	for _, testName := range testNames {
+		t.Run(testName, func(t *testing.T) {
+			module, symbols := buildLoadable(t, conf, testName, data)
+
+			test := symbols["Test"].(func() (int, int))
+			val1, val2 := test()
+			if val1 != 2 {
+				t.Fatalf("expected 2, got %d", val1)
+			}
+			if val2 != 2 {
+				t.Fatalf("expected 2, got %d", val2)
+			}
+			val1, val2 = test()
+			if val1 != 3 {
+				t.Fatalf("expected 3, got %d", val1)
+			}
+			if val2 != 3 {
+				t.Fatalf("expected 3, got %d", val2)
+			}
+			test2 := symbols["Test2"].(func() int)
+			fmt.Printf("Reported: 0x%x\n", test2())
+			test3 := symbols["Test3"].(func() int)
+			val3 := test3()
+			if val3 != common.Val {
+				t.Fatalf("expected %d, got %d", common.Val, val3)
+			}
 			err := module.Unload()
 			if err != nil {
 				t.Fatal(err)
@@ -933,15 +878,7 @@ func TestPackageNameNotEqualToImportPath(t *testing.T) {
 		}
 	}()
 
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_package_path_not_import_path/test.go"},
@@ -968,18 +905,13 @@ func TestPackageNameNotEqualToImportPath(t *testing.T) {
 }
 
 func TestConvertOldAndNewTypes(t *testing.T) {
-	relocs, _ := os.OpenFile("relocs.txt", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0655)
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-		RelocationDebugWriter: relocs,
+	var relocs io.WriteCloser
+	if false {
+		relocs, _ = os.OpenFile("relocs.txt", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0655)
+		defer relocs.Close()
 	}
-	defer relocs.Close()
+	conf := baseConfig
+	conf.RelocationDebugWriter = relocs
 
 	data := testData{
 		files: []string{"./testdata/test_conversion/test.go"},
@@ -1110,16 +1042,7 @@ func (h *SwapperMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func TestStatefulHttpServer(t *testing.T) {
-	conf := jit.BuildConfig{
-		KeepTempFiles:   false,
-		ExtraBuildFlags: nil,
-		BuildEnv:        buildEnv,
-		TmpDir:          "",
-		DebugLog:            false,
-		HeapStrings:         heapStrings,
-		StringContainerSize: stringContainerSize,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_stateful_server/test.go"},
@@ -1190,15 +1113,7 @@ func TestStatefulHttpServer(t *testing.T) {
 */
 
 func TestCloneConnection(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "./",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_clone_connection/test.go"},
@@ -1300,15 +1215,7 @@ func TestCloneConnection(t *testing.T) {
 }
 
 func TestJitSBSSMap(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: randomSymbolOrder,
-	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_init/test.go"},
@@ -1332,18 +1239,11 @@ func TestJitSBSSMap(t *testing.T) {
 }
 
 func TestJitDefer(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              buildEnv,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: false,
-		// If the symbol "gonum.org/v1/gonum/mat.(*LU).updateCond.opendefer" is added before others pertaining to (*LU).updateCond, this test will fail with the fatal error:
-		// runtime: g 73: unexpected return pc for gonum.org/v1/gonum/mat.(*LU).updateCond.func1 called from 0xc004283700
-		// TODO - investigate why
-	}
+	conf := baseConfig
+	// If the symbol "gonum.org/v1/gonum/mat.(*LU).updateCond.opendefer" is added before others pertaining to (*LU).updateCond, this test will fail with the fatal error:
+	// runtime: g 73: unexpected return pc for gonum.org/v1/gonum/mat.(*LU).updateCond.func1 called from 0xc004283700
+	// TODO - investigate why
+	conf.RandomSymbolNameOrder = false
 
 	data := testData{
 		files: []string{"./testdata/test_defer_funcs/test.go"},
@@ -1368,15 +1268,7 @@ func TestJitDefer(t *testing.T) {
 }
 
 func TestAnonymousStructType(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              nil,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: false,
-	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_anonymous_struct_type/test.go"},
@@ -1398,16 +1290,42 @@ func TestAnonymousStructType(t *testing.T) {
 	}
 }
 
-func TestGCGlobals(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              nil,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: false,
+func TestK8s(t *testing.T) {
+	if goVersion(t) < 19 {
+		t.Skip("k8s requires 1.19+")
 	}
+	if runtime.GOOS == "windows" {
+		t.Skip("k8s requires golang/x/sys/windows to init which causes error: Failed to load kernel32.dll: The system cannot find the path specified (possibly a problem in golang.org/x/sys?)")
+	}
+
+	conf := baseConfig
+	conf.UnsafeBlindlyUseFirstmoduleTypes = true
+	data := testData{
+		files: []string{"./testdata/test_k8s/test.go"},
+		pkg:   "./testdata/test_k8s",
+	}
+	testNames := []string{"BuildGoFiles", "BuildGoPackage", "BuildGoText"}
+	for _, testName := range testNames {
+		t.Run(testName, func(t *testing.T) {
+			module, symbols := buildLoadable(t, conf, testName, data)
+
+			testFunc := symbols["TryK8s"].(func())
+			testFunc()
+
+			runtime.GC()
+			runtime.GC()
+			runtime.GC()
+			err := module.Unload()
+			if err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(time.Second)
+		})
+	}
+}
+
+func TestGCGlobals(t *testing.T) {
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_gc_globals/test.go"},
@@ -1435,15 +1353,7 @@ func TestGCGlobals(t *testing.T) {
 }
 
 func TestPprofIssue75(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:              goBinary,
-		KeepTempFiles:         false,
-		ExtraBuildFlags:       nil,
-		BuildEnv:              nil,
-		TmpDir:                "",
-		DebugLog:              false,
-		RandomSymbolNameOrder: false,
-	}
+	conf := baseConfig
 
 	data := testData{
 		files: []string{"./testdata/test_pprof/test.go"},
@@ -1494,17 +1404,34 @@ func TestPprofIssue75(t *testing.T) {
 	}
 }
 
-func TestTypeMismatch(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:                         goBinary,
-		KeepTempFiles:                    false,
-		ExtraBuildFlags:                  nil,
-		BuildEnv:                         nil,
-		TmpDir:                           "",
-		DebugLog:                         false,
-		RandomSymbolNameOrder:            false,
-		UnsafeBlindlyUseFirstmoduleTypes: false, // If set to true, this test should fail (fault)
+func TestJson(t *testing.T) {
+	conf := baseConfig
+
+	data := testData{
+		files: []string{"./testdata/test_json_marshal/test.go"},
+		pkg:   "./testdata/test_json_marshal",
 	}
+	testNames := []string{"BuildGoFiles", "BuildGoPackage", "BuildGoText"}
+	for _, testName := range testNames {
+		t.Run(testName, func(t *testing.T) {
+			module, symbols := buildLoadable(t, conf, testName, data)
+
+			testFunc := symbols["TestJSONMarshal"].(func() string)
+
+			if testFunc() != "1" {
+				t.Fatalf("expected \"1\" but got %s", testFunc())
+			}
+			err := module.Unload()
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestTypeMismatch(t *testing.T) {
+	conf := baseConfig
+	conf.UnsafeBlindlyUseFirstmoduleTypes = false // If set to true, this test should fail (fault)
 
 	data := testData{
 		files: []string{"./testdata/test_type_mismatch/test.go"},
@@ -1573,19 +1500,45 @@ func TestTypeMismatch(t *testing.T) {
 
 }
 
-func TestRemotePkg(t *testing.T) {
-	conf := jit.BuildConfig{
-		GoBinary:                         goBinary,
-		KeepTempFiles:                    false,
-		ExtraBuildFlags:                  nil,
-		BuildEnv:                         nil,
-		TmpDir:                           "",
-		DebugLog:                         false,
-		RandomSymbolNameOrder:            false,
-		UnsafeBlindlyUseFirstmoduleTypes: false, // If set to true, this test should fail (fault)
+func TestRemotePkgs(t *testing.T) {
+	// This test tries to build some massive real world packages as a smoke test.
+	// Ideally in future we'd also build and run the tests for those packages as JIT modules to prove everything works
+	conf := baseConfig
+	conf.UnsafeBlindlyUseFirstmoduleTypes = true // Want to speed this up so avoid building stuff we know hasn't changed
+
+	remotePackagesToBuild := []string{
+		"gonum.org/v1/gonum/mat", // gonum has plenty of asm
 	}
 
-	loadable, err := jit.BuildGoPackageRemote(conf, "gonum.org/v1/gonum/mat", "latest")
+	if goVersion(t) >= 19 && runtime.GOOS != "windows" {
+		remotePackagesToBuild = append(remotePackagesToBuild,
+			"k8s.io/client-go/kubernetes", // K8s is a whopper
+			"k8s.io/client-go/rest")       // also hefty
+	}
+	for _, pkg := range remotePackagesToBuild {
+		loadable, err := jit.BuildGoPackageRemote(conf, pkg, "latest")
+		if err != nil {
+			t.Fatal(err)
+		}
+		module, err := loadable.Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		syms := module.SymbolsByPkg[loadable.ImportPath]
+		for k, v := range syms {
+			fmt.Println(loadable.ImportPath, k, reflect.TypeOf(v))
+		}
+		// To clean up sync.Pools before unload
+		runtime.GC()
+		runtime.GC()
+		err = module.Unload()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// And now something specific
+	loadable, err := jit.BuildGoPackageRemote(conf, "encoding/json", "latest")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1594,26 +1547,7 @@ func TestRemotePkg(t *testing.T) {
 		t.Fatal(err)
 	}
 	syms := module.SymbolsByPkg[loadable.ImportPath]
-	for k, v := range syms {
-		fmt.Println(loadable.ImportPath, k, reflect.TypeOf(v))
-	}
-	err = module.Unload()
-	if err != nil {
-		t.Fatal(err)
-	}
 
-	loadable, err = jit.BuildGoPackageRemote(conf, "encoding/json", "latest")
-	if err != nil {
-		t.Fatal(err)
-	}
-	module, err = loadable.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	syms = module.SymbolsByPkg[loadable.ImportPath]
-	for k, v := range syms {
-		fmt.Println(loadable.ImportPath, k, reflect.TypeOf(v))
-	}
 	jsonMarshalIndent := syms["MarshalIndent"].(func(interface{}, string, string) ([]byte, error))
 	data, err := jsonMarshalIndent(conf, "", " ")
 	if err != nil {

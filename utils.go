@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"unsafe"
 
 	"github.com/eh-steve/goloader/mmap"
@@ -36,6 +37,40 @@ func bytearrayAlign(b *[]byte, align int) {
 	length := len(*b)
 	if length%align != 0 {
 		*b = append(*b, make([]byte, align-length%align)...)
+	}
+}
+
+func createArchNops(arch *sys.Arch, size int) []byte {
+	if arch.Name == "arm64" {
+		return createARM64Nops(size)
+	}
+	return createX86Nops(size)
+}
+
+func createX86Nops(size int) []byte {
+	nops := make([]byte, size)
+	for i := range nops {
+		nops[i] = x86amd64NOPcode
+	}
+	return nops
+}
+
+func createARM64Nops(size int) []byte {
+	if size%4 != 0 {
+		panic(fmt.Sprintf("can't make nop instruction if padding is not multiple of 4, got %d", size))
+	}
+
+	nops := make([]byte, size)
+	for i := 0; i < size/4; i += 4 {
+		copy(nops[i:], arm64NopCode)
+	}
+	return nops
+}
+
+func bytearrayAlignNops(arch *sys.Arch, b *[]byte, align int) {
+	length := len(*b)
+	if length%align != 0 {
+		*b = append(*b, createArchNops(arch, align-length%align)...)
 	}
 }
 
@@ -157,4 +192,13 @@ func expandGoroot(s string) string {
 		return filepath.ToSlash(filepath.Join(runtime.GOROOT(), s[n:]))
 	}
 	return s
+}
+
+func goVersion() int64 {
+	GoVersionParts := strings.Split(strings.TrimPrefix(runtime.Version(), "go"), ".")
+	version, err := strconv.ParseInt(GoVersionParts[1], 10, 64)
+	if err != nil {
+		panic(fmt.Sprintf("failed to parse go version: %s", err))
+	}
+	return version
 }
