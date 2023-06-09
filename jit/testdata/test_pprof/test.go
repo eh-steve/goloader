@@ -5,11 +5,11 @@ import (
 	"time"
 )
 
-func TestPprof() int {
+func TestPprofIssue75() int {
 	var m = map[string]int{}
 	for i := 0; i < 100; i++ {
 		m[fmt.Sprintf("%v", i)] = i
 	}
-	time.Sleep(time.Second / 1000)
+	time.Sleep(time.Microsecond * 200)
 	return m["1"]
 }

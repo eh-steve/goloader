@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	_ "net/http/pprof"
 	"os"
 	"reflect"
@@ -22,6 +23,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -1432,7 +1434,7 @@ func TestGCGlobals(t *testing.T) {
 	}
 }
 
-func TestPprof(t *testing.T) {
+func TestPprofIssue75(t *testing.T) {
 	conf := jit.BuildConfig{
 		GoBinary:              goBinary,
 		KeepTempFiles:         false,
@@ -1460,16 +1462,34 @@ func TestPprof(t *testing.T) {
 				log.Println(server.ListenAndServe())
 			}()
 
-			testFunc := symbols["TestPprof"].(func() int)
-			for i := 0; i < 10000; i++ {
+			keepRequesting := atomic.Value{}
+			keepRequesting.Store(true)
+			requestCount := 0
+			go func() {
+				r, err := http.NewRequest("GET", "http://localhost:6060/debug/pprof/heap?debug=1", nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for keepRequesting.Load() == true {
+					respRec := httptest.NewRecorder()
+					http.DefaultServeMux.ServeHTTP(respRec, r)
+					if respRec.Code != 200 {
+						t.Errorf("Got a non-200 response: %d %s", respRec.Code, respRec.Body.String())
+					}
+					requestCount++
+				}
+			}()
+			testFunc := symbols["TestPprofIssue75"].(func() int)
+			for i := 0; i < 1000; i++ {
 				testFunc()
 			}
-
+			keepRequesting.Store(false)
+			fmt.Println(requestCount)
 			err := module.Unload()
 			if err != nil {
 				t.Fatal(err)
 			}
-			time.Sleep(time.Second)
+			time.Sleep(time.Millisecond * 100)
 		})
 	}
 }
