@@ -1681,6 +1681,29 @@ func TestTypeMismatch(t *testing.T) {
 
 }
 
+func TestIssue96(t *testing.T) {
+	conf := baseConfig
+
+	data := testData{
+		files: []string{"./testdata/test_issue96/test.go"},
+		pkg:   "./testdata/test_issue96",
+	}
+	testNames := []string{"BuildGoFiles", "BuildGoPackage", "BuildGoText"}
+	for _, testName := range testNames {
+		t.Run(testName, func(t *testing.T) {
+			module, symbols := buildLoadable(t, conf, testName, data)
+
+			testFunc := symbols["NewStructX"]
+			results := reflect.ValueOf(testFunc).Call(nil)
+			fmt.Println(results[0].Interface().(interface{ Do() error }).Do())
+			err := module.Unload()
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestRemotePkgs(t *testing.T) {
 	// This test tries to build some massive real world packages as a smoke test.
 	// Ideally in future we'd also build and run the tests for those packages as JIT modules to prove everything works
